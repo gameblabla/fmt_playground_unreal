@@ -41,19 +41,21 @@
  * Carried forward from the earlier RUN386-based src/main.c (see git
  * history), which used a 1:1 (non-zoomed) single-page 8bpp mode at
  * 15kHz timing:
- *   - ZOOM=0 -> base x-zoom=1, y-zoom=1
- *   - single-page mode (video[0] bit4 clear) + FO0 != 0 and FO0 != LO0
- *     -> TownsCRTC::GetLowResPageZoom2X() multiplies y-zoom by 2 (not 4),
- *     giving 240 source lines -> 480 physical scanlines (15kHz line
- *     doubling) with 1:1 horizontal pixels.
+ *   - ZOOM's low nibble (page 0 X-zoom) = 1 -> TownsCRTC::
+ *     GetLowResPageZoom2X() computes zoom.x()=(ZOOM&15)+1 in *2 fixed
+ *     point, i.e. raw field value N means an (N+1)/2 actual multiplier -
+ *     so N=0 is a *0.5* horizontal zoom (half-width, black right half of
+ *     the frame, exactly what earlier TOWNSEMU screenshots of this
+ *     register set showed) and N=1 is the 1.0/"1:1 pixels" we actually
+ *     want. The Y nibble can stay 0: single-page mode + FO0 != 0 and
+ *     FO0 != LO0 makes GetLowResPageZoom2X() separately multiply the Y
+ *     zoom by 2 for 15kHz timing (240 source lines -> 480 physical
+ *     scanlines), which turns Y's own baseline 0.5 into the desired 1.0
+ *     without needing a nonzero Y nibble here.
  *   - LO0=0x0020 -> bytesPerLine = LO0*8 = 256 (single-page mode).
  *   - FA0=0 -> VRAM display starts at byte offset 0.
  *   - HDE0-HDS0=0x200(512) -> monitor width (HDE-HDS)/2 = 256 px.
  *   - VDE0-VDS0=0x0F0(240) -> monitor height (VDE-VDS)*2 = 480 px.
- *
- * NOTE: as of this port, TOWNSEMU screenshots of this register set still
- * show horizontal color banding instead of the full picture; the exact
- * CRTC geometry bug is not yet resolved (see task notes / final report).
  */
 static const crtc_set_t crtc = {
    /* 00 HSW1 */ 0x0074, /* 01 HSW2 */ 0x0530, /* 02 ---- */      0, /* 03 ---- */      0,
@@ -62,7 +64,7 @@ static const crtc_set_t crtc = {
    /* 0C HDE1 */ 0x02E7, /* 0D VDS0 */ 0x0046, /* 0E VDE0 */ 0x0136, /* 0F VDS1 */ 0x0046,
    /* 10 VDE1 */ 0x0136, /* 11 FA0  */ 0x0000, /* 12 HAJ0 */ 0x00E7, /* 13 FO0  */ 0x0001,
    /* 14 LO0  */ 0x0020, /* 15 FA1  */ 0x0000, /* 16 HAJ1 */ 0x00E7, /* 17 FO1  */ 0x0001,
-   /* 18 LO1  */ 0x0020, /* 19 EHAJ */ 0x0056, /* 1A EVAJ */ 0x0007, /* 1B ZOOM */ 0x0000,
+   /* 18 LO1  */ 0x0020, /* 19 EHAJ */ 0x0056, /* 1A EVAJ */ 0x0007, /* 1B ZOOM */ 0x0001,
    /*
     * CR0 bits[1:0] select page 0's color depth (TownsCRTC::
     * GetPageBitsPerPixel: in single-page mode, CL==3 -> 8bpp,
@@ -75,8 +77,20 @@ static const crtc_set_t crtc = {
    /* 1C CR0  */ 0x002B, /* 1D CR1  */ 0x0001, /* 1E FR   */ 0x0002, /* 1F CR2  */ 0x0188
 };
 
-/* video[0] = 0x0F: single-page mode (bit4 clear), CL=3 (8bpp) */
-static const video_set_t video = { 0x0f, 0x09 };
+/*
+ * video[1] (sifter[1]) bits[5:4] select which palette bank the analog
+ * palette I/O ports (0xFD90-0xFD96) actually write to: PLT==0 or 2 route
+ * writes to the 16-color palette (TownsCRTC::AnalogPalette::Set16),
+ * PLT==1 or 3 route to the 256-color palette (Set256) that 8bpp page 0
+ * actually reads from (see TOWNSEMU's crtcbase.cpp SetRed/Green/Blue).
+ * The previous value 0x09 has PLT=(0x09>>4)&3=0, so load_palette()'s
+ * writes were silently landing in the unused 16-color bank, leaving the
+ * real 256-color palette at its uninitialized/garbage reset state -
+ * this was the actual cause of the black screen (VRAM image data and
+ * CRTC geometry were both already correct). 0x18 (PLT=1) matches the
+ * known-working register set in display_settings_8bit.txt.
+ */
+static const video_set_t video = { 0x0A, 0x18 };
 
 //----------------------------------------------------------------
 // Linked-in image / palette (see src/boot/assets.S)
