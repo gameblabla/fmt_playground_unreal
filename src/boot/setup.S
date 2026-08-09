@@ -28,8 +28,21 @@ start:
 
 	push	%cs
 	pop	%ds
-	lidt	idt_48 - start	# load idt with 0,0
-	lgdt	gdt_48 - start	# load gdt with whatever appropriate
+	/*
+	 * NOTE: these use bare `idt_48`/`gdt_48` (not `idt_48 - start` /
+	 * `gdt_48 - start` as in the classic floppy-boot code this was
+	 * adapted from). The old "- start" form produced a *section-local*
+	 * offset (correct only under the fixed-SETUPSEG floppy scheme,
+	 * where DS was reloaded to a segment aliased exactly to `start`,
+	 * i.e. offset 0). Here DS is just CS = INITSEG (see `push %cs; pop
+	 * %ds` above), and `start` itself lives well past INITSEG:0 (right
+	 * after bootsect.S's now-variable-sized code - see bootsect.S's
+	 * comment on `ljmp $INITSEG, $start`). Bare symbols get a proper
+	 * link-time relocation to their true final offset from INITSEG:0,
+	 * same mechanism bootsect.S already relies on for that jump.
+	 */
+	lidt	idt_48	# load idt with 0,0
+	lgdt	gdt_48	# load gdt with whatever appropriate
 
 
 /*
@@ -78,7 +91,20 @@ idt_48:
 
 gdt_48:
 	.word	0x800		# gdt limit=2048, 256 GDT entries
-	.word	512+gdt - start,0x9	# gdt base = 0X9xxxx
+	/*
+	 * gdt base = 0x9xxxx (INITSEG segment, physical 0x90000 + offset).
+	 * The low word must be `gdt`'s actual final linked offset from
+	 * INITSEG:0 in the combined bootsect+setup image. The old
+	 * "512 + gdt - start" formula assumed the classic floppy-boot
+	 * convention of a fixed 512-byte bootsect (so setup always starts
+	 * at offset 512); that's stale here since bootsect.S and setup.S are
+	 * linked+relocated together as one blob (see bootsect.S) and our
+	 * custom CD bootsect is nowhere near 512 bytes. Using the bare
+	 * symbol `gdt` lets the linker fix up the real absolute offset
+	 * (same mechanism bootsect.S already relies on for
+	 * `ljmp $INITSEG, $start`).
+	 */
+	.word	gdt,0x9
 
 msg1:
 	.asciz "Setup.S\r\n"
