@@ -47,15 +47,31 @@
  *     so N=0 is a *0.5* horizontal zoom (half-width, black right half of
  *     the frame, exactly what earlier TOWNSEMU screenshots of this
  *     register set showed) and N=1 is the 1.0/"1:1 pixels" we actually
- *     want. The Y nibble can stay 0: single-page mode + FO0 != 0 and
- *     FO0 != LO0 makes GetLowResPageZoom2X() separately multiply the Y
- *     zoom by 2 for 15kHz timing (240 source lines -> 480 physical
- *     scanlines), which turns Y's own baseline 0.5 into the desired 1.0
- *     without needing a nonzero Y nibble here.
+ *     want.
  *   - LO0=0x0020 -> bytesPerLine = LO0*8 = 256 (single-page mode).
  *   - FA0=0 -> VRAM display starts at byte offset 0.
  *   - HDE0-HDS0=0x200(512) -> monitor width (HDE-HDS)/2 = 256 px.
  *   - VDE0-VDS0=0x0F0(240) -> monitor height (VDE-VDS)*2 = 480 px.
+ *
+ * NOTE on Y ("*2 for 15kHz" / "line-doubling"): an earlier version of
+ * this comment claimed FO0!=0 && FO0!=LO0 makes
+ * TownsCRTC::GetLowResPageZoom2X() double the Y zoom to turn a 0.5
+ * baseline into 1.0 for 480 physical scanlines. That is not what
+ * happens at render time: with these FO0/LO0 values,
+ * TownsRender::Render8Bit (TOWNSEMU/src/towns/render/render.cpp) ends
+ * up with ZV=layer.zoom2x.y()/2=1, meaning each of our 240 source rows
+ * maps to exactly ONE physical screen row (verified empirically - see
+ * verify_pixels.py, 0% mismatch treating screen y = top_y + row, NOT
+ * top_y + 2*row). "Display Size:(256,480)" in TOWNSEMU's PRINT CRTC
+ * output is the CRTC's scan-geometry bound, not a guarantee the layer
+ * gets vertically duplicated to fill it - we simply draw into the top
+ * 240 of those 480 rows and leave the rest black. Getting genuine
+ * 2x row-doubling would require zoom2x.y()=4 (ZV=2), which the FO0==0
+ * or FO0==LO0 branch of GetLowResPageZoom2X provides, but that same
+ * condition also halves GetPageSizeOnMonitor's height, and the two
+ * effects cancel out coverage-wise rather than compounding - not worth
+ * chasing for this example, since a static top-aligned 256x240 image
+ * is exactly what we want.
  */
 static const crtc_set_t crtc = {
    /* 00 HSW1 */ 0x0074, /* 01 HSW2 */ 0x0530, /* 02 ---- */      0, /* 03 ---- */      0,
@@ -109,15 +125,49 @@ void inter(struct eregs *trap_regs)
 //----------------------------------------------------------------
 // VRAM blit
 //----------------------------------------------------------------
+/*
+ * Low-res single-page 8bpp VRAM is NOT a simple linear/row-major byte
+ * array on real FM TOWNS hardware (and TOWNSEMU faithfully reproduces
+ * this): TownsRender::BuildImage() (TOWNSEMU/src/towns/render/render.cpp)
+ * renders single-page mode through VRAM1Trans (TOWNSEMU/src/towns/
+ * render/render.h), which remaps every "logical" scanline byte offset
+ * (row*bytesPerLine + column, exactly what a naive linear blit would
+ * use) through:
+ *     phys = ((off&4)<<16) | ((off&0x7FFF8)>>1) | (off&3)
+ * before reading VRAM. This is the real single-page-mode VRAM
+ * addressing (bit 2 of the logical offset selects which of the two
+ * 256KB VRAM planes a 4-byte group lives in, and the rest of the
+ * address is halved/packed accordingly) - it is not an emulator quirk
+ * or a CRTC register misconfiguration.
+ *
+ * A plain row-major Put_Image (writing srow[x] to vram[y*stride+x])
+ * writes to the *logical* offset directly instead of its transformed
+ * physical address, so the renderer ends up sampling 4-byte chunks
+ * from the wrong interleaved location - this produced the vertical
+ * comb/stripe artifact seen on screen even though a raw VRAM memory
+ * dump (SAVEMEMDUMP, which reads linearly and bypasses VRAM1Trans)
+ * matched IMAGE.RAW byte-for-byte.
+ *
+ * The fix: apply the same forward transform when writing, so the byte
+ * for logical offset N lands at the physical address the renderer will
+ * look it up from (verified bijective/collision-free for our 256x240
+ * image's offset range 0..61439, max physical address 0x477FF, well
+ * inside VRAM0).
+ */
+static inline uint32_t vram_singlepage_trans(uint32_t off)
+{
+    return ((off & 4u) << 16) | ((off & 0x7fff8u) >> 1) | (off & 3u);
+}
+
 static void Put_Image(const uint8_t *src, int width, int height, int stride)
 {
     volatile uint8_t *vram = (volatile uint8_t *)(TOWNS_VRAM0_BASE_MARTY + VRAM_OFFSET);
 
     for (int y = 0; y < height; y++) {
         const uint8_t *srow = src + y * width;
-        volatile uint8_t *drow = vram + y * stride;
         for (int x = 0; x < width; x++) {
-            drow[x] = srow[x];
+            uint32_t off = (uint32_t)y * (uint32_t)stride + (uint32_t)x;
+            vram[vram_singlepage_trans(off)] = srow[x];
         }
     }
 }
