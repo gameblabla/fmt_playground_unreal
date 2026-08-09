@@ -231,10 +231,24 @@ void _dl_start(void)
 	 * data access using the global offset table.
 	 */
 #if !ELF_MACHINE_NO_REL
-	elf_dynamic_do_rel(&map,
-		map.l_info[DT_REL]->d_un.d_ptr,
-		map.l_info[DT_RELSZ]->d_un.d_val);
-	if (map.l_info[DT_PLTREL]->d_un.d_val == DT_REL) {
+	if (map.l_info[DT_REL] != NULL) {
+		elf_dynamic_do_rel(&map,
+			map.l_info[DT_REL]->d_un.d_ptr,
+			map.l_info[DT_RELSZ]->d_un.d_val);
+	}
+	/*
+	 * DT_PLTREL/DT_JMPREL/DT_PLTRELSZ are only present when the object
+	 * has PLT relocations. This build links with -Bsymbolic and has no
+	 * PLT, so l_info[DT_PLTREL] is NULL - dereferencing it unconditionally
+	 * (as upstream glibc's bootstrap dl-reloc.c does, assuming a PLT
+	 * always exists) reads garbage from physical address 0 (low
+	 * memory/IVT) and, if that garbage happened to equal DT_REL, fed
+	 * more NULL-deref garbage as the reladdr/relsize of a bogus second
+	 * elf_dynamic_do_rel() call - manifesting as an infinite loop here
+	 * that never falls through to start_main().
+	 */
+	if (map.l_info[DT_PLTREL] != NULL &&
+	    map.l_info[DT_PLTREL]->d_un.d_val == DT_REL) {
 		elf_dynamic_do_rel(&map,
 			map.l_info[DT_JMPREL]->d_un.d_ptr,
 			map.l_info[DT_PLTRELSZ]->d_un.d_val);
@@ -242,10 +256,13 @@ void _dl_start(void)
 #endif
 
 #if !ELF_MACHINE_NO_RELA
-	elf_dynamic_do_rela(&map,
-		map.l_info[DT_RELA]->d_un.d_ptr,
-		map.l_info[DT_RELASZ]->d_un.d_val);
-	if (map.l_info[DT_PLTREL]->d_un.d_val == DT_RELA) {
+	if (map.l_info[DT_RELA] != NULL) {
+		elf_dynamic_do_rela(&map,
+			map.l_info[DT_RELA]->d_un.d_ptr,
+			map.l_info[DT_RELASZ]->d_un.d_val);
+	}
+	if (map.l_info[DT_PLTREL] != NULL &&
+	    map.l_info[DT_PLTREL]->d_un.d_val == DT_RELA) {
 		elf_dynamic_do_rela(&map,
 			map.l_info[DT_JMPREL]->d_un.d_ptr,
 			map.l_info[DT_PLTRELSZ]->d_un.d_val);
