@@ -12,9 +12,8 @@ CD/*.EXP
 common/*.o
 src/*.o
 *.iso
-BOOT.BIN
+IPL.BIN
 mygame_shared
 mygame_shared.bin
 src/boot/*.s
-src/boot/payload_len.h
 CD/SYSTEM.BIN

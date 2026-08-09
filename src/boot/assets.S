@@ -5,7 +5,7 @@
  * The old RUN386/.EXP path loaded these at runtime from files on the CD's
  * ISO9660 filesystem (IMAGE.RAW / PALETTE.BIN, via DOS int 0x21 handle
  * I/O). The bare-metal boot path has no filesystem driver and no DOS, so
- * instead the same two files (produced by tools/png2fmt from og_image.png)
+ * instead the same two files (produced by tools/png2fmt from its 320x240 PNG)
  * are embedded directly into the ELF as data and linked in.
  */
 

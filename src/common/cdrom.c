@@ -83,25 +83,56 @@ static int wait_status_bit(uint8_t bit)
  * -1 if none arrived. */
 static int read_status(void)
 {
+    uint8_t status[4];
+
+    if (fmt_cdc_read_status(status) != 0) {
+        return -1;
+    }
+    return (int)status[0];
+}
+
+/*----------------------------------------------------------------------
+ * Raw CDC command interface - see cdrom.h.
+ *--------------------------------------------------------------------*/
+
+int fmt_cdc_status_pending(void)
+{
+    return (inb(CD_MASTER_CTRL_STATUS) & CD_STATUS_SRQ) != 0;
+}
+
+int fmt_cdc_read_status(uint8_t status[4])
+{
     if (wait_status_bit(CD_STATUS_SRQ) != 0) {
         return -1;
     }
-    int code = (int)inb(CD_COMMAND_STATUS);
-    (void)inb(CD_COMMAND_STATUS);
-    (void)inb(CD_COMMAND_STATUS);
-    (void)inb(CD_COMMAND_STATUS);
-    return code;
+    for (int i = 0; i < 4; i++) {
+        status[i] = (uint8_t)inb(CD_COMMAND_STATUS);
+    }
+    return 0;
+}
+
+void fmt_cdc_ack(void)
+{
+    outb(CD_ACK_SIRQ_DEI, CD_MASTER_CTRL_STATUS);
 }
 
 /* Drop any status left over from a previous command and clear its
  * interrupt flags, so the status codes we match on below are certain to
  * belong to the command we are about to issue. */
-static void drain_status(void)
+void fmt_cdc_drain_status(void)
 {
     for (int i = 0; i < 64 && (inb(CD_MASTER_CTRL_STATUS) & CD_STATUS_SRQ); i++) {
         (void)inb(CD_COMMAND_STATUS);
     }
-    outb(CD_ACK_SIRQ_DEI, CD_MASTER_CTRL_STATUS);
+    fmt_cdc_ack();
+}
+
+void fmt_cdc_issue(uint8_t cmd, const uint8_t param[8])
+{
+    outb(cmd, CD_COMMAND_STATUS);
+    for (int i = 0; i < 8; i++) {
+        outb(param[i], CD_PARAMETER_DATA);
+    }
 }
 
 /* Fills in the 9 bytes a MODE1READ takes: the command byte followed by
@@ -119,16 +150,6 @@ static void build_read_command(uint32_t lba, uint16_t count, uint8_t cmd[9])
     cmd[8] = 0;
 }
 
-/* Writing the 8th parameter byte is what actually starts the command,
- * so this must always write all 9 in order. */
-static void issue_read_command(const uint8_t cmd[9])
-{
-    outb(cmd[0], CD_COMMAND_STATUS);
-    for (int i = 1; i < 9; i++) {
-        outb(cmd[i], CD_PARAMETER_DATA);
-    }
-}
-
 int fmt_cdrom_read(uint32_t lba, uint16_t count, void *buf)
 {
     uint8_t *dst = (uint8_t *)buf;
@@ -138,9 +159,9 @@ int fmt_cdrom_read(uint32_t lba, uint16_t count, void *buf)
         return 0;
     }
 
-    drain_status();
+    fmt_cdc_drain_status();
     build_read_command(lba, count, cmd);
-    issue_read_command(cmd);
+    fmt_cdc_issue(cmd[0], &cmd[1]);
 
     /* Per-sector handshake: the drive posts 0x22 (data ready) into the
      * status FIFO when a sector is available, we enable software (CPU)
@@ -196,7 +217,7 @@ void fmt_cdrom_stream_init(fmt_cd_stream *st, uint32_t lba, uint32_t size,
     st->cmd_idx = sizeof st->cmd; /* nothing to issue yet */
     st->state = FMT_CD_STREAM_IDLE;
     st->loop = (uint8_t)(loop ? 1 : 0);
-    drain_status();
+    fmt_cdc_drain_status();
 }
 
 unsigned fmt_cdrom_stream_step(fmt_cd_stream *st, uint32_t play_pos,

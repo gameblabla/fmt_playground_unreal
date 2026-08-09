@@ -2,75 +2,113 @@
 #define FMT_PIXEL_H
 
 #include <stdint.h>
+#include "io.h"
 
 /*
- * Fast pixel-plot primitives for FM TOWNS *linear* addressing modes
- * only (fmt_mode_t.linear==1, i.e. 2-page/VRAM0Trans - see libfmt.h).
- * Each is named set_pixel_<width>_<bpp> and hardcodes that mode's
- * VRAM stride, so there's no runtime stride lookup/branch: just an
- * offset computation and one store.
+ * Packed-pixel drawing for the native FM TOWNS low-resolution VRAM window.
  *
- * Do NOT call these against single-page (swizzled) modes such as
- * FMT_MODE_256x240_8BPP/FMT_MODE_320x240_8BPP/FMT_MODE_320x240_16BPP -
- * VRAM byte order there follows vram_singlepage_trans() (libfmt.c),
- * not row-major, so a direct offset write lands on the wrong pixel.
- * Use fmt_put_image() for those, or add a set_pixel that runs the
- * offset through the same transform if a single-page fast-path is
- * ever needed.
+ * In single-page mode, four consecutive logical bytes alternate between the
+ * VRAM's two 16-bit banks.  TOWNSEMU models the same mapping with
+ * TownsSinglePageVRAMAddressTransform::SinglePageOffsetToLinearOffset().
+ * Transforming the byte offset here lets one aligned 32-bit CPU store update
+ * four 8bpp pixels (or two RGB555 pixels) in one packed-pixel transfer.
  *
- * We run with flat, 4GB-limit segments throughout - the real-mode ->
- * protected-mode transition (src/boot/setup.S, src/boot/head.S) loads
- * a big-limit descriptor once and never touches it again (the classic
- * "unreal mode" trick, just carried into full 32-bit protected mode
- * instead of staying in real mode). That means every segment register
- * already maps the full 32-bit physical address space identically, so
- * a plain physical address is a valid pointer under any of them: none
- * of the asm below reloads a segment register (no `mov %ax,%gs` etc.)
- * before touching VRAM - it would be redundant work on every single
- * pixel plot.
+ * The one-pixel 8bpp path uses the hardware packed-pixel mask registers.  It
+ * performs a byte store with only the requested byte lane enabled,
+ * then restores the all-writable mask expected by normal VRAM code.
+ *
+ * Coordinates are intentionally unchecked.  The 4-pixel routine requires x
+ * divisible by 4; the 2-pixel routines require x divisible by 2.  All pixels
+ * in a call must fit on the scanline.
  */
-#define FMT_VRAM0_LINEAR_BASE 0xA00000u
+#define FMT_VRAM0_BASE                 0xA00000u
+#define FMT_VRAM_MASK_ADDRESS_PORT     0x0458u
+#define FMT_VRAM_MASK_DATA_LOW_PORT    0x045Au
+#define FMT_VRAM_MASK_DATA_HIGH_PORT   0x045Bu
 
-#define FMT_DEFINE_SET_PIXEL_8(NAME, WIDTH)                                  \
-static inline void NAME(uint16_t x, uint16_t y, uint8_t color)               \
-{                                                                             \
-    volatile uint8_t *p =                                                    \
-        (volatile uint8_t *)(FMT_VRAM0_LINEAR_BASE + (uint32_t)y * (WIDTH) + x); \
-    __asm__ volatile (                                                       \
-        "movb %1, (%0)"                                                      \
-        :                                                                    \
-        : "r" (p), "q" (color)                                               \
-        : "memory"                                                           \
-    );                                                                       \
+static inline uint32_t fmt_vram_singlepage_offset(uint32_t logical_offset)
+{
+    return ((logical_offset & 4u) << 16)
+         | ((logical_offset & 0x7fff8u) >> 1)
+         |  (logical_offset & 3u);
 }
 
-#define FMT_DEFINE_SET_PIXEL_16(NAME, WIDTH)                                        \
-static inline void NAME(uint16_t x, uint16_t y, uint16_t color)                     \
-{                                                                                    \
-    volatile uint16_t *p = (volatile uint16_t *)(FMT_VRAM0_LINEAR_BASE               \
-        + (uint32_t)y * (WIDTH) * 2u + (uint32_t)x * 2u);                           \
-    __asm__ volatile (                                                              \
-        "movw %1, (%0)"                                                             \
-        :                                                                           \
-        : "r" (p), "r" (color)                                                      \
-        : "memory"                                                                  \
-    );                                                                              \
+static inline void fmt_vram_set_packed_mask(uint32_t mask)
+{
+    outb(0, FMT_VRAM_MASK_ADDRESS_PORT);
+    outb((uint8_t)mask, FMT_VRAM_MASK_DATA_LOW_PORT);
+    outb((uint8_t)(mask >> 8), FMT_VRAM_MASK_DATA_HIGH_PORT);
+    outb(1, FMT_VRAM_MASK_ADDRESS_PORT);
+    outb((uint8_t)(mask >> 16), FMT_VRAM_MASK_DATA_LOW_PORT);
+    outb((uint8_t)(mask >> 24), FMT_VRAM_MASK_DATA_HIGH_PORT);
 }
 
-/* 8bpp: single-page-only bit depth (see libfmt.h), so these are only
- * valid to call if you've built a linear 8bpp mode yourself - none of
- * libfmt's built-in modes are both 8bpp and linear. Provided for
- * completeness/forward compatibility. */
-FMT_DEFINE_SET_PIXEL_8(set_pixel_256_8, 256)
-FMT_DEFINE_SET_PIXEL_8(set_pixel_320_8, 320)
-FMT_DEFINE_SET_PIXEL_8(set_pixel_512_8, 512)
-FMT_DEFINE_SET_PIXEL_8(set_pixel_640_8, 640)
+static inline void fmt_vram_store32(uint32_t logical_offset, uint32_t pixels)
+{
+    volatile uint32_t *dst = (volatile uint32_t *)(FMT_VRAM0_BASE
+        + fmt_vram_singlepage_offset(logical_offset));
+    __asm__ volatile ("movl %1,(%0)" : : "r" (dst), "r" (pixels) : "memory");
+}
 
-/* 16bpp (RGB555 - build values with common.h's rgb15()): matches
- * FMT_MODE_320x240_16BPP (single-page - do not use these against it),
- * FMT_MODE_640x400_16BPP_LINEAR, FMT_MODE_512x480_16BPP_LINEAR. */
-FMT_DEFINE_SET_PIXEL_16(set_pixel_320_16, 320)
-FMT_DEFINE_SET_PIXEL_16(set_pixel_512_16, 512)
-FMT_DEFINE_SET_PIXEL_16(set_pixel_640_16, 640)
+static inline void fmt_vram_store16(uint32_t logical_offset, uint16_t pixels)
+{
+    volatile uint16_t *dst = (volatile uint16_t *)(FMT_VRAM0_BASE
+        + fmt_vram_singlepage_offset(logical_offset));
+    __asm__ volatile ("movw %1,(%0)" : : "r" (dst), "r" (pixels) : "memory");
+}
+
+static inline void fmt_vram_store8(uint32_t logical_offset, uint8_t pixel)
+{
+    volatile uint8_t *dst = (volatile uint8_t *)(FMT_VRAM0_BASE
+        + fmt_vram_singlepage_offset(logical_offset));
+    __asm__ volatile ("movb %1,(%0)" : : "r" (dst), "q" (pixel) : "memory");
+}
+
+static inline void Set_4Pixels_320x240_8bpp(
+    uint16_t x, uint16_t y, uint32_t packed_pixels)
+{
+    fmt_vram_store32((uint32_t)y * 320u + x, packed_pixels);
+}
+
+static inline void Set_2Pixels_320x240_8bpp(
+    uint16_t x, uint16_t y, uint8_t color0, uint8_t color1)
+{
+    fmt_vram_store16((uint32_t)y * 320u + x,
+        (uint16_t)color0 | ((uint16_t)color1 << 8));
+}
+
+static inline void Set_Pixel_320x240_8bpp(
+    uint16_t x, uint16_t y, uint8_t color)
+{
+    uint32_t logical = (uint32_t)y * 320u + x;
+    uint32_t lane = logical & 3u;
+    fmt_vram_set_packed_mask(0xffu << (lane * 8u));
+    fmt_vram_store8(logical, color);
+    fmt_vram_set_packed_mask(0xffffffffu);
+}
+
+static inline void Set_2Pixels_320x240_15bpp(
+    uint16_t x, uint16_t y, uint16_t color0, uint16_t color1)
+{
+    fmt_vram_store32(((uint32_t)y * 320u + x) * 2u,
+        (uint32_t)color0 | ((uint32_t)color1 << 16));
+}
+
+static inline void Set_Pixel_320x240_15bpp(
+    uint16_t x, uint16_t y, uint16_t color)
+{
+    fmt_vram_store16(((uint32_t)y * 320u + x) * 2u, color);
+}
+
+/* Existing lowercase spelling retained for source compatibility. */
+static inline void set_pixel_320_8(uint16_t x, uint16_t y, uint8_t color)
+{
+    Set_Pixel_320x240_8bpp(x, y, color);
+}
+
+static inline void set_pixel_320_16(uint16_t x, uint16_t y, uint16_t color)
+{
+    Set_Pixel_320x240_15bpp(x, y, color);
+}
 
 #endif

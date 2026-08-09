@@ -64,6 +64,47 @@
 int fmt_cdrom_read(uint32_t lba, uint16_t count, void *buf);
 
 /*----------------------------------------------------------------------
+ * Raw CDC command interface
+ *
+ * The sector reader above is one user of the CDC; CD-DA playback
+ * (cdda.[ch]) is another, and it drives the same command/status
+ * handshake with a completely different set of commands and no data
+ * transfer at all. These are the shared primitives, so the port numbers
+ * and the four-reads-per-status-entry rule live in exactly one place.
+ *
+ * Command bytes carry flags in their top bits (Table I-6-3): bit 7
+ * TYPE (0 = PLAY command, 1 = STATE control command - already part of
+ * the command codes as written, e.g. 0x84 CDDASTOP), bit 6 IRQ, bit 5
+ * STATUS. Everything here polls, so pass FMT_CDC_FLAG_STATUS (to get a
+ * status reply at all) and never FMT_CDC_FLAG_IRQ.
+ *--------------------------------------------------------------------*/
+
+#define FMT_CDC_FLAG_STATUS   0x20  /* Command status request */
+#define FMT_CDC_FLAG_IRQ      0x40  /* Raise IRQ on status - unused here */
+
+/* Drops any status left over from a previous command and clears its
+ * interrupt flags. Call before issuing a command whose reply you intend
+ * to match on. */
+void fmt_cdc_drain_status(void);
+
+/* Writes a command byte followed by its 8 parameter bytes. The 8th
+ * parameter byte is what starts the command, so all nine always go out.
+ * Issues no waits - poll for the reply with fmt_cdc_read_status(). */
+void fmt_cdc_issue(uint8_t cmd, const uint8_t param[8]);
+
+/* 1 if a status entry is waiting (SRQ set), 0 if not. Never blocks. */
+int fmt_cdc_status_pending(void);
+
+/* Reads one 4-byte status FIFO entry into `status`, waiting for it to
+ * arrive. Returns 0, or -1 if it never did. status[0] is the status
+ * code (see the CDSTAT/FMT_CDSTAT values used by cdrom.c/cdda.c). */
+int fmt_cdc_read_status(uint8_t status[4]);
+
+/* Acknowledges/clears SIRQ+DEI - see CD_ACK_SIRQ_DEI in cdrom.c for why
+ * leaving them set wedges the drive's command state machine. */
+void fmt_cdc_ack(void);
+
+/*----------------------------------------------------------------------
  * Streaming reader
  *
  * fmt_cdrom_read() above blocks for the whole transfer, which is fine

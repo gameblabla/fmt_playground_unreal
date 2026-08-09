@@ -33,22 +33,20 @@
  * So true 8bpp only exists in single-page mode - the 2-page/linear
  * modes below are 16bpp (RGB555, see common.h's rgb15()).
  *
- * 15kHz modes (256x240/320x240) share one geometry/timing
- * (HSW/HST/VST/EET/EHAJ/EVAJ), carried forward from the
- * verified-working 256x240 8bpp register set (see git history b2020fc
- * and earlier), differing only in width/bpp (HDE0-HDS0, LO0) or
- * vertical size (VDE0-VDS0).
+ * The 256x240 8bpp and 320x240 16bpp modes use native 15kHz timing.
+ * The 320x240 8bpp mode instead uses 31kHz 640x480 timing with CRTC
+ * zoom (2,2), displaying its 320x240 source at 2x in both directions.
  *
- * 640x400/512x480 run at 31kHz, with a different HST (CRTC total
- * horizontal dot count) and clock select (CR1 bits[1:0]) - derived
+ * The 640x400/512x480/640x480 modes also run at 31kHz, with a different
+ * HST (CRTC total horizontal dot count) and clock select (CR1 bits[1:0]) - derived
  * from TownsCRTC::GetHorizontalFrequency()'s formula
  * (CLKSELtoHz[CLKSEL]/HST)/1000 == 31, using CLKSEL=2 (25175000Hz,
  * the same 25.175MHz dot clock as VGA 640x480@60Hz) and HST=800
  * (0x320) -> 25175000/800/1000 == 31 exactly. At this frequency,
  * TownsCRTC::GetPageSizeOnMonitor() maps monitor size directly to
  * HDE0-HDS0 / VDE0-VDS0 (no /2 or *2 fixups - those only apply at
- * 15kHz), which is much simpler to reason about. Both 31kHz modes run
- * in 2-page/linear 16bpp mode. Verified booting cleanly in TOWNSEMU
+ * 15kHz), which is much simpler to reason about. Those three 16bpp
+ * modes run in 2-page/linear mode. Verified booting cleanly in TOWNSEMU
  * (see commit history) - not validated against real Marty hardware.
  */
 typedef enum {
@@ -57,6 +55,7 @@ typedef enum {
     FMT_MODE_320x240_16BPP,
     FMT_MODE_640x400_16BPP_LINEAR,
     FMT_MODE_512x480_16BPP_LINEAR,
+    FMT_MODE_640x480_16BPP_LINEAR,
     FMT_NUM_MODES
 } fmt_mode_id_t;
 

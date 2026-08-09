@@ -27,27 +27,29 @@ static const fmt_mode_t g_modes[FMT_NUM_MODES] = {
         .video = { 0x0A, 0x18 },
     },
     /*
-     * Same 15kHz timing as the 256x240 mode above (HSW/HST/VST/EET/
-     * EHAJ/EVAJ unchanged - it's the same scan geometry), widened to
-     * 320 columns: HDE0-HDS0 = 2*width, LO0 = stride/8. Vertical size
-     * (VDS0/VDE0) is untouched since height is unchanged.
+     * 31kHz single-page 8bpp, displaying a 320x240 source at 2x zoom as
+     * 640x480.  The timing and display spans match the verified 640x480
+     * register family below; LO0 remains the unzoomed 320-byte source
+     * stride (LO0*8 in single-page mode).  At 31kHz ZOOM=0x0011 is the
+     * documented ZH0=2, ZV0=2 setting without the 15kHz special case.
      */
     [FMT_MODE_320x240_8BPP] = {
         .width = 320, .height = 240, .bpp = 8, .stride = 320,
         .crtc = {
-            /* 00 HSW1 */ 0x0074, /* 01 HSW2 */ 0x0530, /* 02 ---- */      0, /* 03 ---- */      0,
-            /* 04 HST  */ 0x0617, /* 05 VST1 */ 0x000C, /* 06 VST2 */ 0x0018, /* 07 EET  */ 0x0030,
-            /* 08 VST  */ 0x049A, /* 09 HDS0 */ 0x00E7, /* 0A HDE0 */ 0x0367, /* 0B HDS1 */ 0x00E7,
-            /* 0C HDE1 */ 0x0367, /* 0D VDS0 */ 0x0046, /* 0E VDE0 */ 0x0136, /* 0F VDS1 */ 0x0046,
-            /* 10 VDE1 */ 0x0136, /* 11 FA0  */ 0x0000, /* 12 HAJ0 */ 0x00E7, /* 13 FO0  */ 0x0001,
-            /* 14 LO0  */ 0x0028, /* 15 FA1  */ 0x0000, /* 16 HAJ1 */ 0x00E7, /* 17 FO1  */ 0x0001,
-            /* 18 LO1  */ 0x0028, /* 19 EHAJ */ 0x0056, /* 1A EVAJ */ 0x0007, /* 1B ZOOM */ 0x0001,
-            /* 1C CR0  */ 0x002B, /* 1D CR1  */ 0x0001, /* 1E FR   */ 0x0002, /* 1F CR2  */ 0x0188
+            /* 00 HSW1 */ 0x003C, /* 01 HSW2 */ 0x02AA, /* 02 ---- */      0, /* 03 ---- */      0,
+            /* 04 HST  */ 0x0320, /* 05 VST1 */ 0x0005, /* 06 VST2 */ 0x000B, /* 07 EET  */ 0x0015,
+            /* 08 VST  */ 0x020D, /* 09 HDS0 */ 0x0050, /* 0A HDE0 */ 0x02D0, /* 0B HDS1 */ 0x0050,
+            /* 0C HDE1 */ 0x02D0, /* 0D VDS0 */ 0x0010, /* 0E VDE0 */ 0x01F0, /* 0F VDS1 */ 0x0010,
+            /* 10 VDE1 */ 0x01F0, /* 11 FA0  */ 0x0000, /* 12 HAJ0 */ 0x0050, /* 13 FO0  */ 0x0001,
+            /* 14 LO0  */ 0x0028, /* 15 FA1  */ 0x0000, /* 16 HAJ1 */ 0x0050, /* 17 FO1  */ 0x0001,
+            /* 18 LO1  */ 0x0028, /* 19 EHAJ */ 0x0056, /* 1A EVAJ */ 0x0007, /* 1B ZOOM */ 0x0011,
+            /* 1C CR0  */ 0x002B, /* 1D CR1  */ 0x0002, /* 1E FR   */ 0x0002, /* 1F CR2  */ 0x0188
         },
         .video = { 0x0A, 0x18 },
     },
     /*
-     * Same 320x240 geometry, 16bpp: LO0 doubles (2 bytes/pixel) and
+     * Separate native 15kHz 320x240 geometry in 16bpp: LO0 doubles
+     * (2 bytes/pixel) and
      * CR0 bits[1:0] switch from 3 (8bpp) to 2 (16bpp) per
      * TownsCRTC::GetPageBitsPerPixel. 16bpp pixels are RGB555 - build
      * them with common.h's rgb15() macro.
@@ -111,6 +113,30 @@ static const fmt_mode_t g_modes[FMT_NUM_MODES] = {
             /* 10 VDE1 */ 0x01F0, /* 11 FA0  */ 0x0000, /* 12 HAJ0 */ 0x0060, /* 13 FO0  */ 0x0001,
             /* 14 LO0  */ 0x0100, /* 15 FA1  */ 0x0000, /* 16 HAJ1 */ 0x0060, /* 17 FO1  */ 0x0001,
             /* 18 LO1  */ 0x0100, /* 19 EHAJ */ 0x0056, /* 1A EVAJ */ 0x0007, /* 1B ZOOM */ 0x0000,
+            /* 1C CR0  */ 0x0001, /* 1D CR1  */ 0x0002, /* 1E FR   */ 0x0002, /* 1F CR2  */ 0x0188
+        },
+        .video = { 0x1B, 0x18 },
+    },
+    /*
+     * Same 31kHz horizontal timing/width as the 640x400 mode
+     * (HSW/HST/HDS0-HDE0/HAJ0/LO0 identical - both are 640 columns
+     * wide), with the vertical block borrowed from the 512x480 mode
+     * instead (VST1/VST2/EET/VST/VDS0-VDE0) to get 480 rows: same
+     * 525-line vertical total as standard VGA 640x480@60Hz at this
+     * 25.175MHz/800 horizontal timing. "15bpp" here means RGB555
+     * packed into a 16-bit VRAM word, same as every other 16bpp mode
+     * in this table - see common.h's rgb15().
+     */
+    [FMT_MODE_640x480_16BPP_LINEAR] = {
+        .width = 640, .height = 480, .bpp = 16, .stride = 1280, .linear = 1,
+        .crtc = {
+            /* 00 HSW1 */ 0x003C, /* 01 HSW2 */ 0x02AA, /* 02 ---- */      0, /* 03 ---- */      0,
+            /* 04 HST  */ 0x0320, /* 05 VST1 */ 0x0005, /* 06 VST2 */ 0x000B, /* 07 EET  */ 0x0015,
+            /* 08 VST  */ 0x020D, /* 09 HDS0 */ 0x0050, /* 0A HDE0 */ 0x02D0, /* 0B HDS1 */ 0x0050,
+            /* 0C HDE1 */ 0x02D0, /* 0D VDS0 */ 0x0010, /* 0E VDE0 */ 0x01F0, /* 0F VDS1 */ 0x0010,
+            /* 10 VDE1 */ 0x01F0, /* 11 FA0  */ 0x0000, /* 12 HAJ0 */ 0x0050, /* 13 FO0  */ 0x0001,
+            /* 14 LO0  */ 0x0140, /* 15 FA1  */ 0x0000, /* 16 HAJ1 */ 0x0050, /* 17 FO1  */ 0x0001,
+            /* 18 LO1  */ 0x0140, /* 19 EHAJ */ 0x0056, /* 1A EVAJ */ 0x0007, /* 1B ZOOM */ 0x0000,
             /* 1C CR0  */ 0x0001, /* 1D CR1  */ 0x0002, /* 1E FR   */ 0x0002, /* 1F CR2  */ 0x0188
         },
         .video = { 0x1B, 0x18 },

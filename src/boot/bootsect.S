@@ -25,13 +25,20 @@
  *   - Fields at offset 0x20 (4 bytes) / 0x24 (4 bytes) from the IPL4
  *     magic are read by the FM TOWNS UX/Marty ROM disk's chain-loader to
  *     validate this is a real IPL before it lets the boot ROM's normal
- *     IPL4 dispatch run; per docs/HOWFMTOWNS_BOOTS_FROM_CD.txt, they can
- *     just point back at the boot sector itself (start sector 0, length
- *     0 works: verified against the same known-good CD IPL test image).
+ *     IPL4 dispatch run: it takes them as the first sector / sector
+ *     count of the disc's IO.SYS, loads that range, and only falls
+ *     through to running our IPL once the data it read fails to look
+ *     like a TOWNS OS IO.SYS it needs to patch. See
+ *     docs/HOWFMTOWNS_BOOTS_FROM_CD.txt.
+ *   - The payload's own location is NOT a build-time constant. It is
+ *     patched into the two 32-bit fields at 0x28/0x2C by
+ *     tools/inject_ipl.py once the ISO has actually been built, read
+ *     out of that very ISO's directory records (mirroring how Fujitsu's
+ *     own IPL.COM patches the IO.SYS LBA into the IPL it injects). See
+ *     the comment on those fields below.
  */
 
 #include "defs.h"
-#include "payload_len.h"
 
 .code16
 .section ".bootsect", "ax", @progbits
@@ -44,14 +51,43 @@ _main:
 .org 4
 	jmp	real_start
 
-/* UX/Marty ROM chain-load compatibility fields: point back at ourselves
- * (sector 0, length 0) so the ROM disk's older-IO.SYS patch logic accepts
- * this disc as bootable and falls through to running our IPL, instead of
- * trying to interpret us as a TOWNS OS IO.SYS to patch.
+/* UX/Marty ROM chain-load compatibility fields ("where is IO.SYS?").
+ *
+ * These point back at ourselves: start sector 0, length 1 sector. The
+ * ROM disk reads that range to linear 0x400, sees "IPL4" rather than the
+ * "FBIOS" magic of a TOWNS OS IO.SYS, gives up on chain-loading and
+ * hands the disc to the boot ROM's normal IPL4 dispatch - which is
+ * exactly what we want.
+ *
+ * The length must be at least 1: per docs/HOWFMTOWNS_BOOTS_FROM_CD.txt
+ * the range has to be *readable by the BIOS*, or the UX/Marty ROM
+ * declares the device unbootable and moves on to the next one. A length
+ * of 0 (what this used to say) is not a readable range on real UX/Marty
+ * hardware, even though the Marty ROM under TOWNSEMU tolerates it.
  */
 .org 0x20
-	.long	0
+	.long	0		/* IO.SYS start sector: ourselves, LBA 0 */
 .org 0x24
+	.long	1		/* IO.SYS length: 1 sector (must be >= 1) */
+
+/* Our own payload descriptor, patched by tools/inject_ipl.py after the
+ * ISO is built: the LBA and 2048-byte sector count of CD/SYSTEM.BIN
+ * (mygame_shared.bin) as it actually landed in the finished filesystem.
+ *
+ * These used to be build-time constants from a generated payload_len.h,
+ * discovered by running mkisofs over CD/ a second time in the Makefile.
+ * That was silently wrong whenever the probe ISO and the real ISO
+ * disagreed - most easily by changing a file in CD/ that the header did
+ * not list as a prerequisite (CD/MUSIC.PCM sorts before CD/SYSTEM.BIN,
+ * so its size shifts the payload's LBA), which baked a stale LBA into
+ * the IPL and made the loader read whatever now sits there instead.
+ * Reading the real ISO after the fact cannot go stale.
+ */
+.org 0x28
+payload_lba:
+	.long	0
+.org 0x2c
+payload_sectors:
 	.long	0
 
 .org 0x30
@@ -94,8 +130,21 @@ go:
 load_system:
 	movw	$TSTLOAD, %ax
 	movw	%ax, %es		/* buffer segment, advances per chunk */
-	movw	$PAYLOAD_LBA, %si	/* current LBA, kept in SI across chunks */
-	movw	$PAYLOAD_SECTORS, %di	/* sectors remaining */
+
+	/*
+	 * Payload location comes from our own patched-in descriptor at
+	 * 0x28/0x2C (DS is still INITSEG here, and we live at INITSEG:0).
+	 * The BIOS read below takes the LBA in DX with CX = 0, i.e. 16
+	 * bits of sector number, so a descriptor whose LBA does not fit
+	 * in 16 bits - or one that was never patched (sector count 0) -
+	 * is a build error, not something to read garbage over.
+	 */
+	movw	payload_lba, %si	/* current LBA, kept in SI across chunks */
+	cmpw	$0, payload_lba+2	/* LBA must fit in the BIOS call's DX */
+	jne	read_error
+	movw	payload_sectors, %di	/* sectors remaining */
+	cmpw	$0, %di			/* unpatched IPL: nothing to load */
+	je	read_error
 
 read_chunk:
 	cmpw	$0, %di
@@ -164,7 +213,7 @@ load_done:
 	 * only made sense there because the floppy loader explicitly read
 	 * "setup" into memory at that fixed offset via its own disk read.
 	 * Here, bootsect.S and setup.S are simply concatenated by
-	 * mygame.bin.lds and both relocated verbatim from BOOTSEG to
+	 * ipl.bin.lds and both relocated verbatim from BOOTSEG to
 	 * INITSEG together (see the `rep movsw` above), so setup.S's actual
 	 * offset from INITSEG is whatever the linker placed it at -
 	 * "start", exported by setup.S. Jumping to the fixed offset 512
