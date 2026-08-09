@@ -127,8 +127,21 @@ read_chunk:
 	subw	%cx, %di		/* sectors remaining -= chunk */
 	addw	%cx, %si		/* LBA += chunk */
 
+	/*
+	 * Advance the buffer segment by one chunk's worth (32 sectors *
+	 * 2048 bytes = 65536 bytes = 0x1000 paragraphs, since a paragraph
+	 * is 16 bytes: 0x10000/16 = 0x1000). The previous constant 0x0800
+	 * was only half of that (0x8000 bytes = 16 sectors), so the second
+	 * and subsequent CD read chunks landed 32768 bytes short of where
+	 * they should have, overlapping/clobbering the second half of the
+	 * previous chunk instead of appending after it - silently
+	 * corrupting everything in the payload past the first ~32KB
+	 * (including main.c's CRTC register array and video/palette
+	 * tables), even though the first 32KB (code, IDT/GDT setup, and
+	 * the start of .rodata) happened to load correctly.
+	 */
 	movw	%es, %ax
-	addw	$0x0800, %ax		/* advance buffer by 32*2048 bytes = 1 segment (0x800 paragraphs) */
+	addw	$0x1000, %ax		/* advance buffer by 32*2048 bytes = 1 segment (0x1000 paragraphs) */
 	movw	%ax, %es
 
 	jmp	read_chunk
