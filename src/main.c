@@ -21,6 +21,7 @@
 #include "io.h"
 #include "libfmt.h"
 #include "fmt_pixel.h"
+#include "sound.h"
 
 //----------------------------------------------------------------
 // Display geometry
@@ -35,6 +36,11 @@
 //----------------------------------------------------------------
 extern const uint8_t g_image_data[];
 extern const uint8_t g_palette_data[];
+
+//----------------------------------------------------------------
+// TEST: a short, audible RF5C68-format triangle-wave PCM sample.
+//----------------------------------------------------------------
+static uint8_t g_test_tone[2400]; /* 1/8 second at 19.2kHz. */
 
 /* Referenced by src/boot/head.S (CPU id storage + IDT default handler). */
 struct cpu_ident cpu_id;
@@ -54,6 +60,18 @@ void start_main(void)
     fmt_load_palette(g_palette_data, 256);
     fmt_put_image(g_image_data, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_STRIDE);
     fmt_wait_vsync();
+
+    for (uint32_t i = 0; i < sizeof(g_test_tone); i++) {
+        uint8_t phase = (uint8_t)(i & 63u);
+        uint8_t magnitude = phase < 32u ? phase : (uint8_t)(63u - phase);
+        /* RF5C68 data is sign/magnitude: bit 7 set is positive.  Avoid the
+         * reserved 0x00 and 0xff codes documented for the chip. */
+        g_test_tone[i] = (phase < 32u) ? (uint8_t)(0x80u + magnitude * 3u) :
+                                        (uint8_t)(1u + magnitude * 3u);
+    }
+    fmt_sound_init();
+    fmt_sound_set_pan(2, FMT_SOUND_PAN_CENTER);
+    fmt_sound_play(2, g_test_tone, sizeof(g_test_tone));
 
     while (1) {
     }

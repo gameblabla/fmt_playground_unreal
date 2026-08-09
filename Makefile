@@ -17,7 +17,8 @@ CFLAGS          = -Isrc/boot -Isrc/common -Isrc -Wall -march=i486 -std=gnu99 -m3
                   -fPIC -Wno-stack-protector -fno-stack-protector -s
 
 OBJS            = src/boot/head.o src/boot/reloc.o src/boot/assets.o src/main.o \
-                  src/common/common.o src/common/palette.o src/common/libfmt.o
+                  src/common/common.o src/common/palette.o src/common/libfmt.o \
+                  src/common/sound.o
 
 BOOTBIN         = BOOT.BIN
 
@@ -113,6 +114,9 @@ src/common/palette.o: src/common/palette.c
 
 src/common/libfmt.o: src/common/libfmt.c src/common/libfmt.h
 	$(CC) -c $(CFLAGS) -o $@ src/common/libfmt.c
+
+src/common/sound.o: src/common/sound.c src/common/sound.h
+	$(CC) -c $(CFLAGS) -o $@ src/common/sound.c
 
 # ---------------------------------------------------------------------
 # Final bootable image: bootsect + setup (fits in the boot ROM's 4-sector
