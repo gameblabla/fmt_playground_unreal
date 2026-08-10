@@ -495,8 +495,17 @@ not_centaur:
 id_done:
 	movl	%edi, %ebx	/* Restore GOT pointer */
 
+#ifndef FMT_NO_RELOC
+	/* Resolve this object's own dynamic relocations (src/boot/reloc.c):
+	 * needed because the CD build links the payload as a PIC shared
+	 * object and loads it wherever the IPL put it. The IC card build
+	 * defines FMT_NO_RELOC and links to fixed addresses instead - there
+	 * is nothing to relocate there, and relocating would rewrite the
+	 * pointers that deliberately point into card space rather than RAM
+	 * (src/boot/icm.lds.S). */
 	leal	_dl_start@GOTOFF(%ebx), %eax
 	call	*%eax
+#endif
 	call	start_main
 	/* In case we return simulate an exception */
 	pushfl

@@ -5,8 +5,7 @@
 #include "libfmt.h"
 #include "palette.h"
 #include "io.h"
-#include "cdrom.h"
-#include "iso9660.h"
+#include "media.h"
 
 /* See mbvplay.h for how the four jobs in here share the CPU. */
 
@@ -49,7 +48,7 @@ static uint8_t g_audio[2][MBV_AUDIO_MAX];
  *   8  frames presented
  *  12  bytes consumed from the stream
  *  16  DAC underruns
- *  20  streaming reader state (FMT_CD_STREAM_*)
+ *  20  streaming reader state (FMT_MEDIA_STREAM_*)
  *  24  vertical blanking interval, microseconds (measured once at startup)
  *  28  palette entries written on the last keyframe
  *  32  microseconds that upload took
@@ -66,14 +65,14 @@ static uint8_t g_audio[2][MBV_AUDIO_MAX];
 #define MBV_STAGE_DONE      6u
 static uint32_t g_stat_stage, g_stat_frames, g_stat_pos;
 static uint32_t g_stat_vblank, g_stat_pal_n, g_stat_pal_us, g_stat_pal_worst;
-static void mbv_stats(const fmt_cd_stream *cd)
+static void mbv_stats(const fmt_media_stream *media)
 {
     MBV_STATS[0] = 0x5356424du;    /* "MBVS" */
     MBV_STATS[1] = g_stat_stage;
     MBV_STATS[2] = g_stat_frames;
     MBV_STATS[3] = g_stat_pos;
     MBV_STATS[4] = fmt_dac.underruns;
-    MBV_STATS[5] = cd ? cd->state : 0xffffffffu;
+    MBV_STATS[5] = media ? media->state : 0xffffffffu;
     MBV_STATS[6] = g_stat_vblank;
     MBV_STATS[7] = g_stat_pal_n;
     MBV_STATS[8] = g_stat_pal_us;
@@ -84,12 +83,12 @@ static void mbv_stats(const fmt_cd_stream *cd)
     g_stat_pal_n = (n); g_stat_pal_us = (us); \
     if ((us) > g_stat_pal_worst) g_stat_pal_worst = (us); } while (0)
 #define MBV_STAT_VBLANK(us) do { g_stat_vblank = (us); } while (0)
-#define MBV_STAGE(s, cd)  do { g_stat_stage = (s); mbv_stats(cd); } while (0)
-#define MBV_PROGRESS(f, p, cd) \
-    do { g_stat_frames = (f); g_stat_pos = (p); mbv_stats(cd); } while (0)
+#define MBV_STAGE(s, media)  do { g_stat_stage = (s); mbv_stats(media); } while (0)
+#define MBV_PROGRESS(f, p, media) \
+    do { g_stat_frames = (f); g_stat_pos = (p); mbv_stats(media); } while (0)
 #else
-#define MBV_STAGE(s, cd)        ((void)0)
-#define MBV_PROGRESS(f, p, cd)  ((void)0)
+#define MBV_STAGE(s, media)        ((void)0)
+#define MBV_PROGRESS(f, p, media)  ((void)0)
 #define MBV_STAT_PAL(n, us)     ((void)0)
 #define MBV_STAT_VBLANK(us)     ((void)0)
 #endif
@@ -102,7 +101,7 @@ static void mbv_stats(const fmt_cd_stream *cd)
 
 static fmt_mbv_info g_info;
 static fmt_mbv_dec  g_dec;
-static uint32_t g_lba, g_size;
+static uint32_t g_media_off, g_size;
 static uint8_t  g_loaded;
 static volatile uint8_t g_stop;
 
@@ -116,13 +115,13 @@ static void poll_dac(void)
 int fmt_mbv_stream_load_file(const char *name)
 {
     g_loaded = 0;
-    if (fmt_iso9660_find(name, &g_lba, &g_size) != 0 || g_size <= MBV_HEADER_BYTES) {
+    if (fmt_media_find(name, &g_media_off, &g_size) != 0 || g_size <= MBV_HEADER_BYTES) {
         return -1;
     }
     /* The header is the first 32 bytes of the file; one sector read is the
      * cheapest way to see them, and the streaming reader will fetch the
      * sector again from the start when playback begins. */
-    if (fmt_cdrom_read(g_lba, 1, g_scratch) != 0) {
+    if (fmt_media_read_block(g_media_off, g_scratch) != 0) {
         return -1;
     }
     if (fmt_mbv_parse_header(g_scratch, &g_info) != 0) {
@@ -133,7 +132,7 @@ int fmt_mbv_stream_load_file(const char *name)
         return -1;
     }
     g_loaded = 1;
-    MBV_STAGE(MBV_STAGE_LOADED, (fmt_cd_stream *)0);
+    MBV_STAGE(MBV_STAGE_LOADED, (fmt_media_stream *)0);
     return 0;
 }
 
@@ -157,11 +156,11 @@ uint32_t fmt_mbv_stream_underruns(void)
  * until it has been decoded.  Only a chunk that straddles the ring's wrap has
  * to be linearised into g_scratch, which is one chunk in every 64KB.
  */
-static int chunk_at(fmt_cd_stream *cd, uint32_t pos,
+static int chunk_at(fmt_media_stream *media, uint32_t pos,
                     const uint8_t **out, uint32_t *out_len)
 {
     uint8_t hdr[MBV_CHUNK_HEADER_BYTES];
-    uint32_t avail = cd->fill_pos - pos;
+    uint32_t avail = media->fill_pos - pos;
     uint32_t start = pos & (MBV_RING - 1u);
     uint32_t clen, i;
 
@@ -344,7 +343,7 @@ static void measure_vblank(void)
 
 int fmt_mbv_stream_play(void)
 {
-    fmt_cd_stream cd;
+    fmt_media_stream media;
     uint32_t pos = MBV_HEADER_BYTES;
     uint32_t clen = 0;
     uint32_t frame;
@@ -367,35 +366,35 @@ int fmt_mbv_stream_play(void)
 #ifdef FMT_MBV_STATS
     measure_vblank();
 #endif
-    MBV_STAGE(MBV_STAGE_MODE, (fmt_cd_stream *)0);
+    MBV_STAGE(MBV_STAGE_MODE, (fmt_media_stream *)0);
 
-    fmt_cdrom_stream_init(&cd, g_lba, g_size, g_ring, MBV_RING, 0);
+    fmt_media_stream_init(&media, g_media_off, g_size, g_ring, MBV_RING, 0);
 
     /* Fill the ring before making a sound.  Nothing is playing yet, so this
      * may take as long as the drive wants. */
-    while (cd.fill_pos < MBV_RING) {
-        if (cd.state == FMT_CD_STREAM_ERROR) {
+    while (media.fill_pos < MBV_RING) {
+        if (media.state == FMT_MEDIA_STREAM_ERROR) {
             return -1;
         }
-        if (cd.state == FMT_CD_STREAM_DONE) {
+        if (media.state == FMT_MEDIA_STREAM_DONE) {
             break;   /* whole file is shorter than the ring */
         }
-        fmt_cdrom_stream_step(&cd, 0, 64);
+        fmt_media_stream_step(&media, 0, 64);
     }
 
-    MBV_STAGE(MBV_STAGE_PRIMED, &cd);
+    MBV_STAGE(MBV_STAGE_PRIMED, &media);
 
     /* Frame 0: a keyframe, so it brings the palette with it. */
     for (;;) {
-        int r = chunk_at(&cd, pos, &chunk, &clen);
+        int r = chunk_at(&media, pos, &chunk, &clen);
         if (r > 0) {
             break;
         }
-        if (r < 0 || cd.state == FMT_CD_STREAM_ERROR ||
-            cd.state == FMT_CD_STREAM_DONE) {
+        if (r < 0 || media.state == FMT_MEDIA_STREAM_ERROR ||
+            media.state == FMT_MEDIA_STREAM_DONE) {
             return -1;
         }
-        fmt_cdrom_stream_step(&cd, pos, 256);
+        fmt_media_stream_step(&media, pos, 256);
     }
     if (fmt_mbv_decode_chunk(&g_dec, chunk, clen, &audio, &alen) != 0) {
         return -1;
@@ -403,7 +402,7 @@ int fmt_mbv_stream_play(void)
     alen = take_audio(audio, alen, g_audio[0]);
     pos += clen;
 
-    MBV_STAGE(MBV_STAGE_FIRST, &cd);
+    MBV_STAGE(MBV_STAGE_FIRST, &media);
     present();
 
     fmt_dac_start();
@@ -414,7 +413,7 @@ int fmt_mbv_stream_play(void)
      * has, and this payload's IDT has no hardware vectors anyway. */
     __asm__ __volatile__("cli");
 
-    MBV_STAGE(MBV_STAGE_PLAYING, &cd);
+    MBV_STAGE(MBV_STAGE_PLAYING, &media);
 
     for (frame = 1; frame < g_info.frame_count; frame++) {
         uint8_t next = which ^ 1u;
@@ -426,16 +425,16 @@ int fmt_mbv_stream_play(void)
             if (g_stop) {
                 goto done;
             }
-            r = chunk_at(&cd, pos, &chunk, &clen);
+            r = chunk_at(&media, pos, &chunk, &clen);
             if (r > 0) {
                 break;
             }
-            if (r < 0 || cd.state == FMT_CD_STREAM_ERROR ||
-                cd.state == FMT_CD_STREAM_DONE) {
+            if (r < 0 || media.state == FMT_MEDIA_STREAM_ERROR ||
+                media.state == FMT_MEDIA_STREAM_DONE) {
                 goto done;
             }
             fmt_dac_tick();
-            fmt_cdrom_stream_step(&cd, pos, 1);
+            fmt_media_stream_step(&media, pos, 1);
         }
 
         /* Decode into the persistent frame buffer.  The decoder ticks the DAC
@@ -454,7 +453,7 @@ int fmt_mbv_stream_play(void)
                 goto done;
             }
             fmt_dac_tick();
-            fmt_cdrom_stream_step(&cd, pos, 1);
+            fmt_media_stream_step(&media, pos, 1);
         }
         fmt_dac_submit(g_audio[next], alen);
         which = next;
@@ -462,11 +461,11 @@ int fmt_mbv_stream_play(void)
         /* The new audio is now playing, which is exactly the cover the blit
          * and the wait for vertical blank need. */
         present();
-        MBV_PROGRESS(frame, pos, &cd);
+        MBV_PROGRESS(frame, pos, &media);
     }
 
 done:
-    MBV_STAGE(MBV_STAGE_DONE, &cd);
+    MBV_STAGE(MBV_STAGE_DONE, &media);
     fmt_dac_stop();
     return 0;
 }

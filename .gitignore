@@ -17,6 +17,8 @@ mygame_shared
 mygame_shared.bin
 src/boot/*.s
 CD/SYSTEM.BIN
+ICM_IPL.BIN
+ICMGAME.BIN
 
 # Generated CD audio/video assets (rebuilt by the Makefile)
 CD/MUSIC.FTV

@@ -18,6 +18,10 @@ CFLAGS          = -Ibuild -Isrc/boot -Isrc/common -Isrc -Wall -march=i386 -std=g
 
 PIXEL_TEST_BPP  ?= 8
 GFX_TEST        ?= 0
+# ICCARD=1 builds for a bootable IC Memory Card instead of a CD-ROM: see
+# the "IC Memory Card target" section near the bottom of this file, and
+# docs/ICCARD.md. `make iccard` is the same thing spelled as a target.
+ICCARD          ?= 0
 VGM_PLAYER      ?= 0
 MP2_PLAYER      ?= 1
 VIDEO_PLAYER    ?= 0
@@ -28,6 +32,22 @@ CFLAGS          += -DFMT_PIXEL_TEST_BPP=$(PIXEL_TEST_BPP) -DFMT_GFX_TEST=$(GFX_T
                   -DFMT_VGM_PLAYER=$(VGM_PLAYER) -DFMT_MP2_PLAYER=$(MP2_PLAYER) \
                   -DFMT_TEST_256x240=$(TEST_256_MODE) -DFMT_YM_BUSY_PROBE=$(BUSY_PROBE) \
                   -DFMT_VIDEO_PLAYER=$(VIDEO_PLAYER)
+
+# Card geometry. ICM_CARD_BASE is where the machine maps the card: the
+# 386SX/Marty's 1MB window by default, 0xC0000000 for a 386DX-class
+# machine (see src/boot/icm_defs.h). It is baked into every const
+# pointer in the payload, so it is a build-time choice, not a runtime
+# one. ICM_SIZE only has to be big enough for what goes on the card.
+ICM_CARD_BASE   ?= 0x00D00000
+ICM_SIZE        ?= 4M
+ifneq ($(ICCARD),0)
+CFLAGS          += -DFMT_TARGET_ICCARD=1 -DFMT_ICM_CARD_BASE=$(ICM_CARD_BASE)
+# head.S's self-relocation (src/boot/reloc.c) is not just unnecessary in
+# this build but actively wrong: the payload is linked to fixed
+# addresses, and a relocating loader would "fix up" the .rodata pointers
+# that are supposed to keep pointing into the card.
+ASDEFS          += -DFMT_NO_RELOC -DFMT_ICM_CARD_BASE=$(ICM_CARD_BASE)
+endif
 
 VGM_SOURCE      = artifacts/neo_holy_war/neo_holy_war_trimmed_opn2_only_optimized.vgm
 VGM_ASSET       = CD/MUSIC.FTV
@@ -71,7 +91,7 @@ IPLBIN          = IPL.BIN
 .DEFAULT_GOAL  := all
 
 FLAGS_STAMP     = build/flags.stamp
-FLAGS_STAMP_TEXT = $(CFLAGS) $(ASFLAGS) MBV_STATS=$(MBV_STATS)
+FLAGS_STAMP_TEXT = $(CFLAGS) $(ASFLAGS) $(ASDEFS) MBV_STATS=$(MBV_STATS)
 .PHONY: force
 $(FLAGS_STAMP): force
 	@mkdir -p build
@@ -155,8 +175,8 @@ src/boot/bootsect.s: src/boot/bootsect.S src/boot/defs.h
 src/boot/setup.s: src/boot/setup.S src/boot/defs.h
 	$(CC) -E -traditional -Isrc/boot $< -o $@
 
-src/boot/head.s: src/boot/head.S src/boot/defs.h src/boot/config.h src/boot/test.h
-	$(CC) -E -traditional -Isrc/boot $< -o $@
+src/boot/head.s: src/boot/head.S src/boot/defs.h src/boot/config.h src/boot/test.h $(FLAGS_STAMP)
+	$(CC) -E -traditional -Isrc/boot $(ASDEFS) $< -o $@
 
 src/boot/bootsect.o: src/boot/bootsect.s $(FLAGS_STAMP)
 	$(AS) -o $@ $<
@@ -269,11 +289,117 @@ src/common/vgmplay.o: src/common/vgmplay.c src/common/vgmplay.h src/common/iso96
 $(IPLBIN): src/boot/bootsect.o src/boot/setup.o src/boot/ipl.bin.lds
 	$(LD) -T src/boot/ipl.bin.lds src/boot/bootsect.o src/boot/setup.o -o $@
 
+# ---------------------------------------------------------------------
+# IC Memory Card target
+#
+# A second, self-contained bootable medium: the game on a card that the
+# boot ROM starts the same way it starts a CD (docs/ICCARD.md). The
+# machine code is the same code - same head.S, same players, same DAC -
+# but the medium is memory rather than a drive, which changes two
+# things.
+#
+# One: no CD hardware is compiled in at all. cdrom.o (the CDC driver),
+# cdda.o (Red Book audio), iso9660.o and scsi.o are simply absent from
+# the link; the players reach their assets through src/common/media.h,
+# which resolves to src/common/icm.c here. A machine booting off a card
+# may have no drive at all, and a driver for a device that is not there
+# can only mislead.
+#
+# Two: the payload is linked to fixed addresses (src/boot/icm.lds.S)
+# rather than built as a PIC object that relocates itself, and its
+# read-only data is linked into the card's own address space, so `const`
+# means "in the card", not "in a copy of the card in RAM".
+# ---------------------------------------------------------------------
+ICM_IPLBIN      = ICM_IPL.BIN
+ICM_IMAGE       = ICMGAME.BIN
+ICM_LDS         = build/icm.lds
+ICM_ELF         = build/icm_payload.elf
+ICM_PAYLOAD     = build/icm_payload.bin
+
+ICM_OBJS        = src/boot/head.o src/boot/assets.o src/main.o \
+                  src/common/common.o src/common/palette.o src/common/libfmt.o src/common/pad.o \
+                  src/common/fmt_layers.o src/common/fmt_sprite.o \
+                  src/common/icm.o src/common/sound.o src/common/pcmstream.o src/common/dacout.o \
+                  src/common/mp2.o src/common/mp2_fast.o src/common/kjmp2_fast.o src/common/mp2stream.o
+ifneq ($(VGM_PLAYER),0)
+ICM_OBJS        += src/common/vgmplay.o
+endif
+ifneq ($(VIDEO_PLAYER),0)
+ICM_OBJS        += src/common/mbv.o src/common/mbvplay.o
+endif
+
+# Which assets get packed onto the card: the same files the CD build
+# stages into CD/, since nothing about them is medium-specific.
+ICM_ASSETS      = $(MP2_ASSET)
+ifneq ($(VGM_PLAYER),0)
+ICM_ASSETS      += $(VGM_ASSET)
+endif
+ifneq ($(VIDEO_PLAYER),0)
+ICM_ASSETS      += $(MBV_ASSET)
+endif
+
+# `make iccard` from a default (CD) build re-enters make with the target
+# selected, so the objects get rebuilt with the right flags rather than
+# being reused from a CD build - the same trap the flags stamp above
+# exists to close.
+ifeq ($(ICCARD),0)
+iccard:
+	$(MAKE) ICCARD=1 $(ICM_IMAGE)
+else
+iccard: $(ICM_IMAGE)
+endif
+
+src/common/icm.o: src/common/icm.c src/common/icm.h src/boot/icm_defs.h $(FLAGS_STAMP)
+	$(CC) -c $(CFLAGS) -o $@ src/common/icm.c
+
+src/boot/icm_ipl.s: src/boot/icm_ipl.S src/boot/defs.h src/boot/icm_defs.h $(FLAGS_STAMP)
+	$(CC) -E -traditional -Isrc/boot $(ASDEFS) $< -o $@
+
+src/boot/icm_ipl.o: src/boot/icm_ipl.s
+	$(AS) -o $@ $<
+
+$(ICM_IPLBIN): src/boot/icm_ipl.o src/boot/icm_ipl.lds
+	$(LD) -T src/boot/icm_ipl.lds src/boot/icm_ipl.o -o $@
+
+# The linker script is preprocessed so it can share icm_defs.h with the
+# IPL and the packer instead of restating the card's layout a third time.
+$(ICM_LDS): src/boot/icm.lds.S src/boot/icm_defs.h
+	@mkdir -p build
+	$(CC) -E -P -traditional -Isrc/boot $(ASDEFS) -x c $< -o $@
+
+# Linked with plain `ld`, not $(LD): $(LD) is `ld -s`, and tools/mkicm.py
+# reads the payload's entry point and layout symbols out of this ELF.
+$(ICM_ELF): $(ICM_OBJS) $(ICM_LDS) Makefile
+	ld --warn-common -T $(ICM_LDS) -o $@ $(ICM_OBJS)
+
+$(ICM_PAYLOAD): $(ICM_ELF)
+	objcopy -O binary $< $@
+
+$(ICM_IMAGE): $(ICM_IPLBIN) $(ICM_ELF) $(ICM_PAYLOAD) $(ICM_ASSETS) tools/mkicm.py
+	python3 tools/mkicm.py --ipl $(ICM_IPLBIN) --payload $(ICM_ELF) \
+		--payload-bin $(ICM_PAYLOAD) --out $@ \
+		--size $(ICM_SIZE) --card-base $(ICM_CARD_BASE) $(ICM_ASSETS)
+
+# Read $(ICM_IMAGE)'s own header and directory back, the way tools/icminfo.py
+# would for a card image that came from somewhere other than this build
+# (downloaded, or dumped off real hardware) - useful as a sanity check on
+# this one too, since it does not trust anything mkicm.py just wrote. Goes
+# through the same ICCARD=1 re-entry as `iccard`, for the same reason.
+.PHONY: iccard-info
+ifeq ($(ICCARD),0)
+iccard-info:
+	$(MAKE) ICCARD=1 iccard-info
+else
+iccard-info: $(ICM_IMAGE)
+	python3 tools/icminfo.py $(ICM_IMAGE)
+endif
+
 clean:
 	rm -f src/boot/*.o src/boot/*.s src/common/*.o src/*.o $(FLAGS_STAMP) \
 		mygame_shared mygame_shared.bin CD/SYSTEM.BIN $(IPLBIN) BOOT.BIN \
 		src/common/pad.o src/common/scsi.o src/common/cdrom.o src/common/sound.o \
-		src/common/iso9660.o src/common/pcmstream.o src/common/dacout.o src/common/cdda.o
+		src/common/iso9660.o src/common/pcmstream.o src/common/dacout.o src/common/cdda.o \
+		src/common/icm.o $(ICM_IPLBIN) $(ICM_IMAGE) $(ICM_LDS) $(ICM_ELF) $(ICM_PAYLOAD)
 	@rm -f $(VGM_ASSET) $(MP2_ASSET) src/common/vgmplay.o src/common/mp2.o src/common/mp2_fast.o src/common/mp2stream.o
 	@rm -f src/common/mbv.o src/common/mbvplay.o build/mbvenc build/t_mbv_round build/t_mbv_blit
 	@rm -f build/*.spr build/*.h
@@ -316,6 +442,11 @@ test: $(MP2_ASSET)
 		tests/mp2_interleave_test.c src/common/kjmp2_fast.c src/common/dacout.c
 	@build/t_interleave $(MP2_ASSET)
 	@echo
+	@echo "== IC card reader: banked reads and the bank-0 resting rule =="
+	$(HOSTCC) $(TEST32FLAGS) -D_GNU_SOURCE -Itests/hostio -Isrc/common -Isrc/boot \
+		-o build/t_icm tests/icm_read_test.c src/common/icm.c
+	@build/t_icm
+	@echo
 	@echo "== MBV: VRAM blit vs libfmt's address transform =="
 	$(HOSTCC) $(TESTFLAGS) -o build/t_mbv_blit tests/mbv_blit_test.c
 	@build/t_mbv_blit
@@ -333,4 +464,4 @@ test: $(MP2_ASSET)
 	@build/mbvenc -q -D build/mbvclip.dump build/mbvclip.rgb build/mbvclip.u8 build/mbvclip.mbv
 	@build/t_mbv_round build/mbvclip.mbv build/mbvclip.dump build/mbvclip.rgb
 
-.PHONY: all clean test
+.PHONY: all clean test iccard

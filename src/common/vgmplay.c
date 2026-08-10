@@ -1,5 +1,5 @@
 #include "vgmplay.h"
-#include "iso9660.h"
+#include "media.h"
 #include "io.h"
 #include <stdint.h>
 
@@ -74,7 +74,7 @@ static void wait_samples(uint16_t samples, uint32_t *fraction)
 
 int fmt_vgm_load_file(const char *name)
 {
-    int32_t loaded = fmt_iso9660_load(name, g_ftv, sizeof(g_ftv));
+    int32_t loaded = fmt_media_load(name, g_ftv, sizeof(g_ftv));
 
     g_loaded = 0;
     if (loaded < (int32_t)FTV_HEADER_SIZE || g_ftv[0] != 'F' ||

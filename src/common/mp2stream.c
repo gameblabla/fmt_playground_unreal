@@ -3,8 +3,7 @@
 #include "kjmp2_fast.h"
 #include "dacout.h"
 #include "io.h"
-#include "cdrom.h"
-#include "iso9660.h"
+#include "media.h"
 
 /*
  * MP2 playback off the data track, through the YM2612 channel-6 DAC.
@@ -28,7 +27,7 @@
  *   - Two frame buffers alternate.  One is playing out while the other is
  *     decoded into, which gives the decoder a whole frame period of slack and
  *     removes any need for ring-wrap arithmetic in the decoder's hot path.
- *   - CD refills happen between frames and from the idle loop, where a few
+ *   - Refills happen between frames and from the idle loop, where a few
  *     hundred microseconds of latency costs nothing.
  */
 
@@ -42,7 +41,7 @@ static uint8_t g_input[MP2_INPUT_RING];
 static uint8_t g_frame[289 + MP2_LOOKAHEAD];
 static uint8_t g_pcm[2][FMT_MP2_SAMPLES_PER_FRAME];
 static kjmp2v_context_t g_decoder;
-static uint32_t g_lba, g_size;
+static uint32_t g_media_off, g_size;
 static uint8_t g_loaded;
 static volatile uint8_t g_stop;
 
@@ -83,7 +82,7 @@ static void mp2_stats_publish(void)
 int fmt_mp2_stream_load_file(const char *name)
 {
     g_loaded = 0;
-    if (fmt_iso9660_find(name, &g_lba, &g_size) || !g_size) return -1;
+    if (fmt_media_find(name, &g_media_off, &g_size) || !g_size) return -1;
     kjmp2v_init(&g_decoder);
     g_loaded = 1;
     return 0;
@@ -95,19 +94,19 @@ void fmt_mp2_stream_stop(void)
     fmt_dac_stop();
 }
 
-/* Copy one compressed frame out of the CD ring, or return 0 if the drive has
+/* Copy one compressed frame out of the input ring, or return 0 if the medium has
  * not delivered all of it yet.  The extra MP2_LOOKAHEAD bytes cover the bit
  * reader's read-ahead window, which can reach just past the frame proper. */
-static unsigned take_frame(fmt_cd_stream *cd, uint32_t *input_pos)
+static unsigned take_frame(fmt_media_stream *media, uint32_t *input_pos)
 {
     unsigned size, i;
 
-    if (cd->fill_pos - *input_pos < 4) return 0;
+    if (media->fill_pos - *input_pos < 4) return 0;
     for (i = 0; i < 4; i++)
         g_frame[i] = g_input[(*input_pos + i) & (MP2_INPUT_RING - 1u)];
     size = fmt_mp2_frame_size(g_frame);
     if (!size) return 0;
-    if (cd->fill_pos - *input_pos < size + MP2_LOOKAHEAD) return 0;
+    if (media->fill_pos - *input_pos < size + MP2_LOOKAHEAD) return 0;
     for (i = 4; i < size + MP2_LOOKAHEAD; i++)
         g_frame[i] = g_input[(*input_pos + i) & (MP2_INPUT_RING - 1u)];
     return size;
@@ -115,23 +114,23 @@ static unsigned take_frame(fmt_cd_stream *cd, uint32_t *input_pos)
 
 int fmt_mp2_stream_play_streaming(void)
 {
-    fmt_cd_stream cd;
+    fmt_media_stream media;
     uint32_t input_pos = 0;
     unsigned size;
     uint8_t which = 0;
 
     if (!g_loaded) return -1;
     g_stop = 0;
-    fmt_cdrom_stream_init(&cd, g_lba, g_size, g_input, MP2_INPUT_RING, 1);
+    fmt_media_stream_init(&media, g_media_off, g_size, g_input, MP2_INPUT_RING, 1);
 
     /* Decode the first frame before making a sound.  Nothing is playing yet,
      * so this one may take as long as it likes. */
     for (;;) {
-        if (cd.state == FMT_CD_STREAM_ERROR) return -1;
-        size = take_frame(&cd, &input_pos);
+        if (media.state == FMT_MEDIA_STREAM_ERROR) return -1;
+        size = take_frame(&media, &input_pos);
         if (size) break;
-        if (cd.state == FMT_CD_STREAM_DONE) return -1;
-        fmt_cdrom_stream_step(&cd, input_pos, 256);
+        if (media.state == FMT_MEDIA_STREAM_DONE) return -1;
+        fmt_media_stream_step(&media, input_pos, 256);
     }
     if (kjmp2v_decode_frame_pcm8(&g_decoder, g_frame, g_pcm[0]) != size) return -1;
     input_pos += size;
@@ -149,14 +148,14 @@ int fmt_mp2_stream_play_streaming(void)
          * output running rather than interrupting it. */
         for (;;) {
             if (g_stop) goto done;
-            size = take_frame(&cd, &input_pos);
+            size = take_frame(&media, &input_pos);
             if (size) break;
-            if (cd.state == FMT_CD_STREAM_ERROR ||
-                cd.state == FMT_CD_STREAM_DONE) goto done;
+            if (media.state == FMT_MEDIA_STREAM_ERROR ||
+                media.state == FMT_MEDIA_STREAM_DONE) goto done;
             /* Waiting on the drive: one I/O step at a time, ticking between
              * each so the deadline is still met while we wait. */
             fmt_dac_tick();
-            fmt_cdrom_stream_step(&cd, input_pos, 1);
+            fmt_media_stream_step(&media, input_pos, 1);
         }
         if (kjmp2v_decode_frame_pcm8(&g_decoder, g_frame, g_pcm[next]) != size) goto done;
         input_pos += size;
@@ -167,7 +166,7 @@ int fmt_mp2_stream_play_streaming(void)
             if (g_stop) goto done;
             fmt_dac_tick();
             MP2_STATS_SAMPLE();
-            fmt_cdrom_stream_step(&cd, input_pos, 1);
+            fmt_media_stream_step(&media, input_pos, 1);
         }
         fmt_dac_submit(g_pcm[next], FMT_MP2_SAMPLES_PER_FRAME);
         which = next;

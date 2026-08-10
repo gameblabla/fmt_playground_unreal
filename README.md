@@ -39,6 +39,19 @@ and 0x24) for the UX and Marty ROMs to hand it control.
 
 This example loads image from CD, loads it into buffer, draws it to VRAM with double buffering/paging and wait for vsync.
 
+Booting from an IC Memory Card
+------------------------------
+
+`make iccard` builds the same game for the FM TOWNS' IC Memory Card slot
+instead of the CD: a card image that the boot ROM starts by itself
+(`./run_icm.sh`, or hold I+C+M at power-on on real hardware). No CD-ROM
+or CD-DA code is compiled into that build at all - a machine booting off
+a card may have no drive - and the payload's `const` data is *linked into
+the card's own address space*, so read-only tables and embedded artwork
+are read from the card in place and cost no RAM.
+
+See `docs/ICCARD.md`.
+
 Full-motion video
 -----------------
 

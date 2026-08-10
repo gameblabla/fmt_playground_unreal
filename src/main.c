@@ -11,6 +11,7 @@
 #include "mbvplay.h"
 #include "io.h"
 #include "dacout.h"
+#include "media.h"
 
 struct cpu_ident cpu_id;
 struct eregs;
@@ -333,6 +334,13 @@ static void ym_busy_probe(void)
 
 void start_main(void)
 {
+    /* Get the asset medium ready before anything asks it for a file. On
+     * the CD build this is nothing at all; on the IC card build it reads
+     * the card's directory. Failing it is not fatal here - the players
+     * below each report their own failure to find what they wanted, and
+     * the graphics tests need no assets whatsoever. */
+    (void)fmt_media_init();
+
 #if FMT_YM_BUSY_PROBE
     ym_busy_probe();
 #elif FMT_VIDEO_PLAYER

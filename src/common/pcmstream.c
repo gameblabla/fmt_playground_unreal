@@ -1,8 +1,7 @@
 #include "pcmstream.h"
 #include "dacout.h"
 #include "io.h"
-#include "cdrom.h"
-#include "iso9660.h"
+#include "media.h"
 
 /* See pcmstream.h for the overall design (ring buffer streamed off the
  * disc from inside the DAC pacing loop). */
@@ -29,7 +28,7 @@
 #define YM_SOUND_AUDIO_ON        0x7F /* MUTE(bit6)=1=output; reserved bits written 1 per the databook's write-format row. */
 
 /* Ring buffer the disc is streamed into. Power of two and a multiple of
- * 2048, at least twice FMT_CD_STREAM_RUN_SECTORS*2048 so a new run can
+ * 2048, at least twice the CD reader's 8-sector run so a new one can
  * be started while the previous one is still playing out. 32KB is about
  * a second of audio at FMT_PCM_STREAM_RATE - far more slack than the
  * few milliseconds a sector handshake actually needs, but it costs
@@ -37,7 +36,7 @@
 #define PCM_RING_BYTES      32768u
 
 static uint8_t g_ring[PCM_RING_BYTES];
-static uint32_t g_lba;
+static uint32_t g_media_off;
 static uint32_t g_size;
 static uint8_t g_loaded;
 static volatile uint8_t g_stop_requested;
@@ -78,7 +77,7 @@ static inline void disable_interrupts(void)
 int fmt_pcm_stream_load_file(const char *name)
 {
     g_loaded = 0;
-    if (fmt_iso9660_find(name, &g_lba, &g_size) != 0 || g_size == 0) {
+    if (fmt_media_find(name, &g_media_off, &g_size) != 0 || g_size == 0) {
         return -1;
     }
     g_loaded = 1;
@@ -93,7 +92,7 @@ void fmt_pcm_stream_stop(void)
 
 int fmt_pcm_stream_play_streaming(void)
 {
-    fmt_cd_stream cd;
+    fmt_media_stream media;
     uint32_t play_pos = 0;
     uint32_t poll = 0;
     uint16_t deadline;
@@ -104,21 +103,21 @@ int fmt_pcm_stream_play_streaming(void)
     }
 
     g_stop_requested = 0;
-    fmt_cdrom_stream_init(&cd, g_lba, g_size, g_ring, PCM_RING_BYTES, 1);
+    fmt_media_stream_init(&media, g_media_off, g_size, g_ring, PCM_RING_BYTES, 1);
 
     /* Prime the ring before the first sample goes out - nothing is
      * playing yet, so there is no harm in spinning the machine flat
      * out here. */
-    while (cd.fill_pos - play_pos < PCM_RING_BYTES) {
-        if (cd.state == FMT_CD_STREAM_ERROR) {
+    while (media.fill_pos - play_pos < PCM_RING_BYTES) {
+        if (media.state == FMT_MEDIA_STREAM_ERROR) {
             return -1;
         }
-        if (cd.state == FMT_CD_STREAM_DONE) {
+        if (media.state == FMT_MEDIA_STREAM_DONE) {
             break; /* file shorter than the ring */
         }
-        fmt_cdrom_stream_step(&cd, play_pos, 64);
+        fmt_media_stream_step(&media, play_pos, 64);
     }
-    if (cd.fill_pos == 0) {
+    if (media.fill_pos == 0) {
         return -1;
     }
 
@@ -158,7 +157,7 @@ int fmt_pcm_stream_play_streaming(void)
             if ((int16_t)(inw(FMT_DAC_FREERUN_TIMER) - deadline) >= 0) {
                 break;
             }
-            fmt_cdrom_stream_step(&cd, play_pos, 1);
+            fmt_media_stream_step(&media, play_pos, 1);
             if (g_stop_requested) {
                 goto done;
             }
@@ -182,7 +181,7 @@ int fmt_pcm_stream_play_streaming(void)
          * so it simply streams until the drive gives up. */
         if (++poll >= 1024u) {
             poll = 0;
-            if (cd.state == FMT_CD_STREAM_ERROR) {
+            if (media.state == FMT_MEDIA_STREAM_ERROR) {
                 break;
             }
         }
@@ -191,12 +190,12 @@ int fmt_pcm_stream_play_streaming(void)
          * and let the machine catch up rather than dropping out of the
          * loop - with the ring sized as it is this should not happen,
          * but a click beats silence. */
-        while (play_pos == cd.fill_pos) {
-            if (cd.state == FMT_CD_STREAM_ERROR ||
-                cd.state == FMT_CD_STREAM_DONE) {
+        while (play_pos == media.fill_pos) {
+            if (media.state == FMT_MEDIA_STREAM_ERROR ||
+                media.state == FMT_MEDIA_STREAM_DONE) {
                 goto done;
             }
-            fmt_cdrom_stream_step(&cd, play_pos, 64);
+            fmt_media_stream_step(&media, play_pos, 64);
         }
     }
 
