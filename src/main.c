@@ -8,6 +8,7 @@
 #include "fmt_sprite.h"
 #include "vgmplay.h"
 #include "mp2stream.h"
+#include "mbvplay.h"
 #include "io.h"
 #include "dacout.h"
 
@@ -21,7 +22,9 @@ void inter(struct eregs *trap_regs)
     (void)trap_regs;
 }
 
-#if !FMT_VGM_PLAYER && FMT_GFX_TEST == 0 && FMT_TEST_256x240
+#define FMT_ANY_PLAYER (FMT_VGM_PLAYER || FMT_VIDEO_PLAYER)
+
+#if !FMT_ANY_PLAYER && FMT_GFX_TEST == 0 && FMT_TEST_256x240
 static void draw_256x240_test(void)
 {
 #if FMT_PIXEL_TEST_BPP == 15
@@ -75,7 +78,7 @@ static void draw_256x240_test(void)
 }
 #endif
 
-#if !FMT_VGM_PLAYER && FMT_GFX_TEST == 0 && !FMT_TEST_256x240 && FMT_PIXEL_TEST_BPP != 15
+#if !FMT_ANY_PLAYER && FMT_GFX_TEST == 0 && !FMT_TEST_256x240 && FMT_PIXEL_TEST_BPP != 15
 static void draw_8bpp_test(void)
 {
     static const uint8_t palette[5 * 3] = {
@@ -133,7 +136,7 @@ static void draw_8bpp_test(void)
 }
 #endif
 
-#if !FMT_VGM_PLAYER && FMT_GFX_TEST == 1
+#if !FMT_ANY_PLAYER && FMT_GFX_TEST == 1
 static void dual_bg_test(void)
 {
     fmt_bg_layer_t bg0={320,240,640};
@@ -149,7 +152,7 @@ static void dual_bg_test(void)
 }
 #endif
 
-#if !FMT_VGM_PLAYER && FMT_GFX_TEST == 2
+#if !FMT_ANY_PLAYER && FMT_GFX_TEST == 2
 static void sprite_test(void)
 {
     fmt_bg_layer_t bg={256,240,512};
@@ -169,7 +172,7 @@ static void sprite_test(void)
 }
 #endif
 
-#if !FMT_VGM_PLAYER && FMT_GFX_TEST == 0 && !FMT_TEST_256x240 && FMT_PIXEL_TEST_BPP == 15
+#if !FMT_ANY_PLAYER && FMT_GFX_TEST == 0 && !FMT_TEST_256x240 && FMT_PIXEL_TEST_BPP == 15
 static void draw_15bpp_test(void)
 {
     const uint16_t red = rgb15(255, 0, 0);
@@ -332,6 +335,13 @@ void start_main(void)
 {
 #if FMT_YM_BUSY_PROBE
     ym_busy_probe();
+#elif FMT_VIDEO_PLAYER
+    /* MBV video with its own interleaved soundtrack: 256x240 8bpp through
+     * hardware page flipping, 16kHz mono out of the YM2612 DAC.  See
+     * src/common/mbvplay.h and docs/MBV_FORMAT.md. */
+    if (fmt_mbv_stream_load_file("VIDEO.MBV") == 0) {
+        fmt_mbv_stream_play();
+    }
 #elif FMT_VGM_PLAYER
     if (fmt_vgm_load_file("MUSIC.FTV") == 0) {
         fmt_vgm_play();

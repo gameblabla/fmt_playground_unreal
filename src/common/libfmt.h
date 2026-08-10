@@ -72,6 +72,11 @@ typedef struct {
     video_set_t video;
 } fmt_mode_t;
 
+/* FM TOWNS VRAM0 as seen through the 386SX (Marty/UX) memory map.  Exposed
+ * because a caller with its own blitter - src/common/mbv_blit.h - needs the
+ * same base libfmt writes through. */
+#define FMT_VRAM0_BASE  0xA00000u
+
 /* Byte offset of the buffer currently selected for drawing.  Pixel
  * primitives use this before applying the single-page VRAM transform. */
 extern uint32_t g_fmt_draw_buffer_offset;
@@ -109,5 +114,13 @@ uint32_t fmt_frame_buffer_size(void);
 int fmt_flip_page(void);
 
 void fmt_wait_vsync(void);
+
+/* Same two, but calling `poll` repeatedly while waiting on the CRTC.  A
+ * vertical blank is up to 16.7ms away and this payload has no interrupts, so
+ * anything with a deadline of its own - the video player's DAC, which wants a
+ * sample every 62.5us - has to be given the wait to spend.  `poll` must be
+ * cheap and must not block. */
+void fmt_wait_vsync_poll(void (*poll)(void));
+int fmt_flip_page_poll(void (*poll)(void));
 
 #endif

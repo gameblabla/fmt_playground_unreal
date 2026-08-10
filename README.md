@@ -38,3 +38,21 @@ including why the IPL still has to claim to have an IO.SYS (bytes 0x20
 and 0x24) for the UX and Marty ROMs to hand it control.
 
 This example loads image from CD, loads it into buffer, draws it to VRAM with double buffering/paging and wait for vsync.
+
+Full-motion video
+-----------------
+
+`make VIDEO_PLAYER=1` builds the MBV player instead: 256x240 8bpp video with
+its own interleaved 16kHz soundtrack, streamed off the data track and decoded
+in software while the YM2612 channel-6 DAC is fed a sample every 62.5us. MBV
+is the block codec described in `video.txt` - 8x8 macroblocks with skip runs
+and motion, 4x4 blocks carrying 1/2/4/8/16 palette indices - implemented in
+`src/common/mbv.[ch]` with the player in `src/common/mbvplay.[ch]` and the
+encoder in `tools/mbvenc.c`.
+
+    make VIDEO_PLAYER=1        # encodes sailor.mkv to CD/VIDEO.MBV and builds the payload
+    ./tools/mkcd.sh            # data-only ISO - the soundtrack is inside the video
+    ./Tsugaru_CUI.elf "$PWD/MARTY_ROM/" -TOWNSTYPE MARTY -CD output.iso -NORMALFD -DONTUSEFPU
+
+See `docs/MBV_FORMAT.md` for the on-disc format, the encoder's knobs, and where
+the CPU time goes.

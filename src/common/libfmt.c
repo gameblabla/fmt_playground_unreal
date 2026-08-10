@@ -9,7 +9,7 @@
  * 386DX/486 FM TOWNS map uses 0x80000000 instead - this library
  * currently only targets Marty.
  */
-#define TOWNS_VRAM0_BASE_MARTY   0xA00000u
+#define TOWNS_VRAM0_BASE_MARTY   FMT_VRAM0_BASE
 #define TOWNS_VRAM_SIZE           0x80000u
 
 static const fmt_mode_t g_modes[FMT_NUM_MODES] = {
@@ -285,11 +285,16 @@ uint32_t fmt_frame_buffer_size(void)
 
 int fmt_flip_page(void)
 {
+    return fmt_flip_page_poll(0);
+}
+
+int fmt_flip_page_poll(void (*poll)(void))
+{
     if (!g_can_flip) {
         return -1;
     }
 
-    fmt_wait_vsync();
+    fmt_wait_vsync_poll(poll);
 
     g_display_page = g_draw_page;
     g_draw_page ^= 1u;
@@ -304,9 +309,20 @@ int fmt_flip_page(void)
 
 void fmt_wait_vsync(void)
 {
+    fmt_wait_vsync_poll(0);
+}
+
+void fmt_wait_vsync_poll(void (*poll)(void))
+{
     outb(30, 0x0440);
     while (inb(0x443) & 4) {
+        if (poll) {
+            poll();
+        }
     }
     while (!(inb(0x443) & 4)) {
+        if (poll) {
+            poll();
+        }
     }
 }

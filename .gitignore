@@ -22,6 +22,7 @@ CD/SYSTEM.BIN
 CD/MUSIC.FTV
 CD/MUSIC.MP2
 CD/MUSIC.PCM
+CD/VIDEO.MBV
 
 # Scratch / editor leftovers
 *.old
