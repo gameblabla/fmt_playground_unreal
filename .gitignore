@@ -17,3 +17,14 @@ mygame_shared
 mygame_shared.bin
 src/boot/*.s
 CD/SYSTEM.BIN
+
+# Generated CD audio/video assets (rebuilt by the Makefile)
+CD/MUSIC.FTV
+CD/MUSIC.MP2
+CD/MUSIC.PCM
+
+# Scratch / editor leftovers
+*.old
+__pycache__/
+build/
+tools/png2fmt/png2fmt

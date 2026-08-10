@@ -33,7 +33,9 @@
  * So true 8bpp only exists in single-page mode - the 2-page/linear
  * modes below are 16bpp (RGB555, see common.h's rgb15()).
  *
- * The 256x240 8bpp and 320x240 16bpp modes use native 15kHz timing.
+ * The 256x240 modes use 31kHz timing with 2x CRTC zoom, displaying the
+ * source in a centered 512x480 viewport.  The 8bpp variant is a single-page
+ * indexed mode; the 16bpp variant is RGB555.
  * The 320x240 8bpp mode instead uses 31kHz 640x480 timing with CRTC
  * zoom (2,2), displaying its 320x240 source at 2x in both directions.
  *
@@ -51,6 +53,7 @@
  */
 typedef enum {
     FMT_MODE_256x240_8BPP,
+    FMT_MODE_256x240_16BPP,
     FMT_MODE_320x240_8BPP,
     FMT_MODE_320x240_16BPP,
     FMT_MODE_640x400_16BPP_LINEAR,
@@ -69,10 +72,13 @@ typedef struct {
     video_set_t video;
 } fmt_mode_t;
 
-/* Stops the display, programs CRTC + palette-bank registers for the
- * given mode, and restarts the display. Does NOT touch the palette
- * itself or VRAM contents - call fmt_load_palette()/fmt_put_image()
- * (or your own) after. */
+/* Byte offset of the buffer currently selected for drawing.  Pixel
+ * primitives use this before applying the single-page VRAM transform. */
+extern uint32_t g_fmt_draw_buffer_offset;
+
+/* Stops the display, programs CRTC + palette-bank registers, clears the
+ * mode's usable VRAM to black, initializes its draw/display pages, and
+ * restarts the display. Does not touch the palette itself. */
 void fmt_set_mode(fmt_mode_id_t id);
 
 /* Mode last passed to fmt_set_mode(), or NULL if none set yet. */
@@ -88,6 +94,19 @@ void fmt_load_palette(const uint8_t *rgb888, int count);
  * 2-page/linear: plain row-major - see libfmt.c). Must be called
  * after fmt_set_mode(). */
 void fmt_put_image(const void *src, int width, int height, int stride);
+
+/* Low-resolution hardware page flipping.  fmt_set_mode() starts with page 0
+ * displayed and page 1 selected for drawing when two complete buffers fit in
+ * 512KB VRAM.  The 31kHz 15bpp modes are too large and return false here.
+ *
+ * fmt_flip_page() waits for a fresh vertical blank, displays the completed
+ * draw page through CRTC FA0, and makes the old display page the new draw
+ * page.  It returns 0 on success or -1 when the mode cannot double-buffer. */
+int fmt_page_flipping_available(void);
+uint8_t fmt_display_page(void);
+uint8_t fmt_draw_page(void);
+uint32_t fmt_frame_buffer_size(void);
+int fmt_flip_page(void);
 
 void fmt_wait_vsync(void);
 

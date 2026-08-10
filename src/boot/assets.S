@@ -24,3 +24,17 @@ g_palette_data:
 	.incbin "CD/PALETTE.BIN"
 .globl g_palette_data_end
 g_palette_data_end:
+
+.globl g_sprite_pisga0
+.balign 4
+g_sprite_pisga0:
+	.incbin "build/PISGA0.spr"
+.globl g_sprite_pisga0_end
+g_sprite_pisga0_end:
+
+.globl g_sprite_shtgb0
+.balign 4
+g_sprite_shtgb0:
+	.incbin "build/SHTGB0.spr"
+.globl g_sprite_shtgb0_end
+g_sprite_shtgb0_end:

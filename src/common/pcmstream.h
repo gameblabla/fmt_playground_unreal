@@ -13,7 +13,8 @@
  * same mechanism FMTOWNS_32KHZPCM_WITHDAC/src/dac_pcm.c uses, ported
  * onto this project's outb()/inb().
  *
- * fmt_pcm_stream_play() streams the file straight off the disc: it
+ * fmt_pcm_stream_play_streaming() streams the loaded file straight off the
+ * disc: it
  * primes a ring buffer, then plays out of it while advancing a
  * non-blocking CD reader (fmt_cdrom_stream_step(), cdrom.[ch]) inside
  * the same loop, during the ~30us the YM2612 is busy after each sample.
@@ -46,13 +47,30 @@
  *                  -t raw CD/MUSIC.PCM gain -n -1 */
 #define FMT_PCM_STREAM_RATE     32000u /* unsigned 8-bit mono samples/sec */
 
-/* Looks up `name` on the CD (via iso9660.c) and streams it out through
- * the YM2612 DAC, looping at the end of the file. Blocking, and does
+/* Looks up `name` on the CD (via iso9660.c).  Loading only records its
+ * location; it does not start CD reads or change the sound hardware. */
+int fmt_pcm_stream_load_file(const char *name);
+
+/* Streams the loaded CD file through the YM2612 DAC, looping at the end of
+ * the file. Blocking, and does
  * not return on its own - there's no interrupt-driven playback in this
  * environment, so nothing else runs while this is going (same as
- * dac_pcm.c's own design), and the only way out is the drive reporting
- * a failure. Returns 0 if playback ended that way, -1 if the file
- * wasn't found or nothing could be read from it. */
-int fmt_pcm_stream_play(const char *name);
+ * dac_pcm.c's own design), and the only way out is the drive reporting a
+ * failure or fmt_pcm_stream_stop(). Returns 0 when stopped, -1 if no file
+ * was loaded or nothing could be read from it. */
+int fmt_pcm_stream_play_streaming(void);
+
+/* Plays an unsigned 8-bit mono PCM buffer already in CPU RAM. The caller
+ * retains ownership of `buffer` and must keep it valid for the (blocking)
+ * duration of playback. The buffer loops at `size`, using the same YM2612
+ * DAC pacing as the streaming variant. Returns 0 when stopped, or -1 when
+ * passed a null or empty buffer. */
+int fmt_pcm_stream_play_buffer(const uint8_t *buffer, uint32_t size);
+
+/* Backwards-compatible name for fmt_pcm_stream_play_streaming(). */
+int fmt_pcm_stream_play(void);
+
+/* Request that playback stop and mute the PCM/FM output immediately. */
+void fmt_pcm_stream_stop(void);
 
 #endif

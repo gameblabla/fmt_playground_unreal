@@ -37,6 +37,10 @@
 #define PCM_RING_BYTES      32768u
 
 static uint8_t g_ring[PCM_RING_BYTES];
+static uint32_t g_lba;
+static uint32_t g_size;
+static uint8_t g_loaded;
+static volatile uint8_t g_stop_requested;
 
 static inline void ym_write(uint8_t reg, uint8_t val)
 {
@@ -71,18 +75,34 @@ static inline void disable_interrupts(void)
     __asm__ __volatile__("cli");
 }
 
-int fmt_pcm_stream_play(const char *name)
+int fmt_pcm_stream_load_file(const char *name)
 {
-    uint32_t lba, size;
+    g_loaded = 0;
+    if (fmt_iso9660_find(name, &g_lba, &g_size) != 0 || g_size == 0) {
+        return -1;
+    }
+    g_loaded = 1;
+    return 0;
+}
+
+void fmt_pcm_stream_stop(void)
+{
+    g_stop_requested = 1;
+    outb(0x00, YM_SOUND_MUTE);
+}
+
+int fmt_pcm_stream_play_streaming(void)
+{
     fmt_cd_stream cd;
     uint32_t play_pos = 0;
     uint32_t poll = 0;
 
-    if (fmt_iso9660_find(name, &lba, &size) != 0 || size == 0) {
+    if (!g_loaded) {
         return -1;
     }
 
-    fmt_cdrom_stream_init(&cd, lba, size, g_ring, PCM_RING_BYTES, 1);
+    g_stop_requested = 0;
+    fmt_cdrom_stream_init(&cd, g_lba, g_size, g_ring, PCM_RING_BYTES, 1);
 
     /* Prime the ring before the first sample goes out - nothing is
      * playing yet, so there is no harm in spinning the machine flat
@@ -112,6 +132,10 @@ int fmt_pcm_stream_play(const char *name)
 
     disable_interrupts();
     for (;;) {
+        if (g_stop_requested) {
+            goto done;
+        }
+
         /* One disc byte per DAC write, 1:1, exactly as dac_pcm.c does
          * it - the file is authored at the DAC's own pace (see
          * FMT_PCM_STREAM_RATE), so there is no resampling to do here.
@@ -131,6 +155,9 @@ int fmt_pcm_stream_play(const char *name)
          * what would otherwise be a spin. */
         while (inb(YM_ADDR0) & YM_BUSY) {
             fmt_cdrom_stream_step(&cd, play_pos, 1);
+            if (g_stop_requested) {
+                goto done;
+            }
         }
 
         /* Checked occasionally rather than every sample - a failing
@@ -172,4 +199,51 @@ int fmt_pcm_stream_play(const char *name)
 done:
     ym_write(YM_REG_DAC_ENABLE, 0x00); /* Restore channel 6 to normal FM synthesis. */
     return 0;
+}
+
+int fmt_pcm_stream_play_buffer(const uint8_t *buffer, uint32_t size)
+{
+    uint32_t play_pos = 0;
+
+    if (buffer == 0 || size == 0) {
+        return -1;
+    }
+
+    g_stop_requested = 0;
+
+    outb(YM_SOUND_MUTE_FM_PCM_ON, YM_SOUND_MUTE);
+    outb(YM_SOUND_AUDIO_ON, YM_SOUND_AUDIO);
+
+    ym_write(YM_REG_DAC_ENABLE, 0x80);
+    while (inb(YM_ADDR0) & YM_BUSY) {
+    }
+    outb(YM_REG_DAC_DATA, YM_ADDR0);
+
+    disable_interrupts();
+    for (;;) {
+        if (g_stop_requested) {
+            break;
+        }
+
+        outb(0, YM_WAIT_1US);
+        outb(buffer[play_pos], YM_DATA0);
+        if (++play_pos == size) {
+            play_pos = 0;
+        }
+
+        while (inb(YM_ADDR0) & YM_BUSY) {
+            if (g_stop_requested) {
+                goto done;
+            }
+        }
+    }
+
+done:
+    ym_write(YM_REG_DAC_ENABLE, 0x00);
+    return 0;
+}
+
+int fmt_pcm_stream_play(void)
+{
+    return fmt_pcm_stream_play_streaming();
 }

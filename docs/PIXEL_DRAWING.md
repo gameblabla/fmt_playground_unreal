@@ -51,3 +51,25 @@ The Makefile defaults to the 8bpp test. Build the other screen with
 `make clean && make PIXEL_TEST_BPP=15`. Keeping each test on screen avoids a
 timing-dependent capture. Native 320x240 screenshots therefore make off-by-one,
 missing-bank, half-width, and overdraw errors measurable rather than subjective.
+
+Hardware page flipping
+----------------------
+
+The 256x240 8bpp, 320x240 8bpp, and 320x240 RGB555 modes fit two complete
+frame buffers in the FM TOWNS' 512KB VRAM. `fmt_set_mode()` clears both,
+displays buffer 0, and selects buffer 1 for drawing. Every packed-pixel helper
+adds `g_fmt_draw_buffer_offset` before applying the single-page bank transform,
+so drawing cannot modify the displayed buffer.
+
+Call `fmt_flip_page()` only after the frame is complete. It waits for a fresh
+vertical blank, writes the hidden buffer's start to CRTC `FA0`, then selects
+the old displayed buffer for the next frame. `FA0` is not a byte address: in
+these modes one count is eight bytes, so the programmed value is
+`page_byte_offset / 8`. `FA1` belongs to layer 1 and must not be changed for
+single-layer page flipping.
+
+The 640x400, 512x480, and 640x480 RGB555 modes cannot use this API: one frame
+uses 512000, 491520, and 614400 bytes respectively, leaving insufficient VRAM
+for a second frame (and the last mode already exceeds native 512KB VRAM).
+`fmt_page_flipping_available()` is false and `fmt_flip_page()` returns -1 for
+those modes.
