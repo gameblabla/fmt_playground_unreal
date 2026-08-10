@@ -46,6 +46,40 @@ static uint32_t g_lba, g_size;
 static uint8_t g_loaded;
 static volatile uint8_t g_stop;
 
+/* Diagnostic counters, published to a fixed address so the player can be
+ * observed in-machine with `MEMDUMP PHYS:00080000` while it runs. Enabled by
+ * `make BUSY_PROBE=1`; compiled out otherwise. See docs and src/main.c. */
+#ifdef FMT_MP2_STATS
+#define MP2_STATS ((volatile uint32_t *)0x00080000u)
+static uint32_t g_frames;
+static uint32_t g_elapsed_us;
+static uint16_t g_stat_prev;
+/* Must be called far more often than the free-running counter's 65.536ms
+ * wrap, not once per frame: a frame is 72ms of audio, so per-frame sampling
+ * aliased every interval down by exactly one wrap and made playback look 11x
+ * faster than it was. Called from the drain loop, which runs every tick. */
+static void mp2_stats_publish(void)
+{
+    uint16_t now = inw(FMT_DAC_FREERUN_TIMER);
+    g_elapsed_us += (uint16_t)(now - g_stat_prev);
+    g_stat_prev = now;
+    MP2_STATS[0] = 0x3253504du;            /* "MP2S" */
+    MP2_STATS[1] = g_frames;
+    MP2_STATS[2] = g_elapsed_us;
+    MP2_STATS[3] = fmt_dac.underruns;
+    MP2_STATS[4] = (uint32_t)fmt_dac.pos;
+    MP2_STATS[5] = 0xA5A5A5A5u;
+}
+#define MP2_STATS_FRAME()  do { g_frames++; mp2_stats_publish(); } while (0)
+#define MP2_STATS_SAMPLE() mp2_stats_publish()
+#define MP2_STATS_START() do { g_frames = 0; g_elapsed_us = 0; \
+                               g_stat_prev = inw(FMT_DAC_FREERUN_TIMER); } while (0)
+#else
+#define MP2_STATS_FRAME()  ((void)0)
+#define MP2_STATS_SAMPLE() ((void)0)
+#define MP2_STATS_START()  ((void)0)
+#endif
+
 int fmt_mp2_stream_load_file(const char *name)
 {
     g_loaded = 0;
@@ -104,6 +138,7 @@ int fmt_mp2_stream_play_streaming(void)
 
     fmt_dac_start();
     fmt_dac_submit(g_pcm[0], FMT_MP2_SAMPLES_PER_FRAME);
+    MP2_STATS_START();
     __asm__ __volatile__("cli");
 
     for (;;) {
@@ -131,10 +166,12 @@ int fmt_mp2_stream_play_streaming(void)
         while (!fmt_dac_drained()) {
             if (g_stop) goto done;
             fmt_dac_tick();
+            MP2_STATS_SAMPLE();
             fmt_cdrom_stream_step(&cd, input_pos, 1);
         }
         fmt_dac_submit(g_pcm[next], FMT_MP2_SAMPLES_PER_FRAME);
         which = next;
+        MP2_STATS_FRAME();
     }
 
 done:

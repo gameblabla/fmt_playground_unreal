@@ -9,6 +9,7 @@
 #include "vgmplay.h"
 #include "mp2stream.h"
 #include "io.h"
+#include "dacout.h"
 
 struct cpu_ident cpu_id;
 struct eregs;
@@ -215,68 +216,112 @@ static void draw_15bpp_test(void)
 #endif
 
 #if FMT_YM_BUSY_PROBE
-/* Measures how long the YM2612 holds its busy flag (0x4D8 bit 7) after each
- * kind of register write, timed against the TOWNS 1us free-running counter at
- * I/O 0x26, and leaves the results at physical 0x00080000 - above this
- * payload, which loads at 0x10000 and is under 256 KiB - so they can be read
- * back with `MEMDUMP PHYS:00080000` in the emulator's console.
+/* In-machine measurement of the three timing paths this project depends on,
+ * left at physical 0x00080000 - above this payload, which loads at 0x10000 and
+ * is under 256 KiB - so it can be read with `MEMDUMP PHYS:00080000 24 1` in
+ * the emulator console.
  *
- * Layout at 0x80000: "YMBZ", then the measured microseconds for an address
- * write, a data write to a register below 0xA0 (the DAC data register 0x2A is
- * one of these), and a data write to a register at or above 0xA0.
+ * Layout, all little-endian 32-bit after the magic:
+ *   0  "YMBZ"
+ *   4  microseconds for 1000 writes to the 1us wait port 0x6C
+ *   8  microseconds for 1000 busy-flag-paced DAC writes (dac_pcm.c's loop)
+ *  12  microseconds for 1000 timer-paced DAC writes at FMT_DAC_RATE
+ *  16  times the free-running counter went backwards in 20000 reads
+ *  20  0xA5A5A5A5 trailer
  *
- * The poll loop itself is one IN plus a test and branch, so a measurement is
- * quantised to roughly a microsecond and reads slightly high. That is ample to
- * tell the real durations from the flat 30us the emulator used to apply.
+ * Elapsed time is accumulated as 16-bit differences so the counter's 65.536ms
+ * wrap does not matter.
  *
  * Build with `make BUSY_PROBE=1`. This is a diagnostic, not part of the demo.
  */
-#define PROBE_RESULTS ((volatile uint8_t *)0x00080000u)
+#define PROBE_RESULTS ((volatile uint32_t *)0x00080000u)
+#define PROBE_ITERS   1000u
 
-static uint8_t probe_one(uint8_t reg, uint8_t val, uint8_t addr_only)
+static void probe_elapsed_step(uint32_t *acc, uint16_t *prev)
 {
-    uint16_t t0, t1;
-
-    while (inb(0x4D8) & 0x80) {
-    }
-    if (addr_only) {
-        t0 = inw(0x26);
-        outb(reg, 0x4D8);
-    } else {
-        outb(reg, 0x4D8);
-        while (inb(0x4D8) & 0x80) {
-        }
-        t0 = inw(0x26);
-        outb(val, 0x4DA);
-    }
-    while (inb(0x4D8) & 0x80) {
-    }
-    t1 = inw(0x26);
-    return (uint8_t)(t1 - t0);
+    uint16_t now = inw(FMT_DAC_FREERUN_TIMER);
+    *acc += (uint16_t)(now - *prev);
+    *prev = now;
 }
+
+static uint8_t g_probe_pcm[PROBE_ITERS];
 
 static void ym_busy_probe(void)
 {
-    uint8_t addr_us = 255, low_us = 255, high_us = 255, i, v;
+    uint32_t wait_us = 0, busy_us = 0, timer_us = 0, backwards = 0;
+    uint16_t prev, now, last;
+    unsigned i;
 
-    outb(0x03, 0x4D5);        /* unmute FM/PCM so the chip is live */
-    outb(0x7f, 0x4EC);
-
-    /* Take the smallest of several runs: the poll loop can only overshoot. */
-    for (i = 0; i < 16; ++i) {
-        v = probe_one(0x2A, 0x80, 1); if (v < addr_us) addr_us = v;
-        v = probe_one(0x2A, 0x80, 0); if (v < low_us)  low_us  = v;
-        v = probe_one(0xA4, 0x10, 0); if (v < high_us) high_us = v;
+    for (i = 0; i < PROBE_ITERS; ++i) {
+        g_probe_pcm[i] = (uint8_t)((i & 16u) ? 168 : 88);
     }
 
-    PROBE_RESULTS[0] = 'Y';
-    PROBE_RESULTS[1] = 'M';
-    PROBE_RESULTS[2] = 'B';
-    PROBE_RESULTS[3] = 'Z';
-    PROBE_RESULTS[4] = addr_us;
-    PROBE_RESULTS[5] = low_us;
-    PROBE_RESULTS[6] = high_us;
-    PROBE_RESULTS[7] = 0xA5;
+    outb(0x03, FMT_DAC_SOUND_MUTE);
+    outb(0x7f, FMT_DAC_SOUND_AUDIO);
+    outb(FMT_DAC_YM_REG_DAC_ENABLE, FMT_DAC_YM_ADDR0);
+    outb(0x80, FMT_DAC_YM_DATA0);
+    while (inb(FMT_DAC_YM_ADDR0) & FMT_DAC_YM_BUSY) {
+    }
+    outb(FMT_DAC_YM_REG_DAC_DATA, FMT_DAC_YM_ADDR0);
+
+    /* 1. Does the free-running counter advance sanely at all? Time a known
+     *    number of 1us waits against it. */
+    prev = inw(FMT_DAC_FREERUN_TIMER);
+    for (i = 0; i < PROBE_ITERS; ++i) {
+        outb(0, 0x6C);
+        probe_elapsed_step(&wait_us, &prev);
+    }
+
+    /* 2. Is it monotonic? */
+    last = inw(FMT_DAC_FREERUN_TIMER);
+    for (i = 0; i < 20000u; ++i) {
+        now = inw(FMT_DAC_FREERUN_TIMER);
+        if ((int16_t)(now - last) < 0) {
+            backwards++;
+        }
+        last = now;
+    }
+
+    /* 3. dac_pcm.c's loop: one wait, one DAC write, spin on the busy flag.
+     *    This is the loop confirmed to reach 32000Hz on real hardware. */
+    prev = inw(FMT_DAC_FREERUN_TIMER);
+    for (i = 0; i < PROBE_ITERS; ++i) {
+        outb(0, 0x6C);
+        outb(g_probe_pcm[i], FMT_DAC_YM_DATA0);
+        while (inb(FMT_DAC_YM_ADDR0) & FMT_DAC_YM_BUSY) {
+        }
+        probe_elapsed_step(&busy_us, &prev);
+    }
+
+    /* 4. The shipping timer-paced path, driven exactly as mp2stream does. */
+    fmt_dac_start();
+    fmt_dac_submit(g_probe_pcm, PROBE_ITERS);
+    prev = inw(FMT_DAC_FREERUN_TIMER);
+    while (!fmt_dac_drained()) {
+        fmt_dac_tick();
+        probe_elapsed_step(&timer_us, &prev);
+    }
+    fmt_dac_stop();
+
+    /* 5. Emit a steady 500Hz square wave through the same timer-paced path,
+     *    forever, so the emulator's own audio recorder can be pointed at a
+     *    signal whose shape is known exactly. Build with BUSY_PROBE=2. */
+#if FMT_YM_BUSY_PROBE == 2
+    fmt_dac_start();
+    for (;;) {
+        fmt_dac_submit(g_probe_pcm, PROBE_ITERS);
+        while (!fmt_dac_drained()) {
+            fmt_dac_tick();
+        }
+    }
+#endif
+
+    PROBE_RESULTS[0] = 0x5A424D59u;   /* "YMBZ" */
+    PROBE_RESULTS[1] = wait_us;
+    PROBE_RESULTS[2] = busy_us;
+    PROBE_RESULTS[3] = timer_us;
+    PROBE_RESULTS[4] = backwards;
+    PROBE_RESULTS[5] = 0xA5A5A5A5u;
 
     while (1) {
     }

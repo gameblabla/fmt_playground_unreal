@@ -168,7 +168,7 @@ src/common/kjmp2_fast.o: src/common/kjmp2_fast.c src/common/kjmp2_fast.h src/com
 	$(CC) -c $(CFLAGS) -DFMT_MP2_DAC_TICK -o $@ src/common/kjmp2_fast.c
 
 src/common/mp2stream.o: src/common/mp2stream.c src/common/mp2stream.h src/common/mp2.h src/common/cdrom.h src/common/iso9660.h src/common/dacout.h
-	$(CC) -c $(CFLAGS) -o $@ src/common/mp2stream.c
+	$(CC) -c $(CFLAGS) $(if $(filter-out 0,$(BUSY_PROBE)),-DFMT_MP2_STATS) -o $@ src/common/mp2stream.c
 
 src/common/cdda.o: src/common/cdda.c src/common/cdda.h src/common/cdrom.h
 	$(CC) -c $(CFLAGS) -o $@ src/common/cdda.c
