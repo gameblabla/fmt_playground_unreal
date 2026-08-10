@@ -39,10 +39,18 @@ typedef uint16_t kjmp2v_psg10_code_t;
 #define MP2PSG_GAIN_SHIFT 1
 #endif
 
-/* kjmp2v_context_t: decoder state.  Allocate one per stream. */
+/* kjmp2v_context_t: decoder state.  Allocate one per stream.
+ *
+ * V is the synthesis delay bank.  It is 16-bit, not 32-bit: every value
+ * written into it is a DCT output already scaled down by 64, and probing the
+ * full 306-second 16 kHz asset never produced a magnitude above 264 - nine
+ * significant bits, against int16's fifteen.  Halving the type halves both
+ * the buffer (16 KiB -> 8 KiB) and, on the 386SX's 16-bit external bus, the
+ * bus cycles every one of the ~30k V reads per frame costs.  A 32-bit load
+ * needs two bus cycles there; a 16-bit load needs one. */
 typedef struct _kjmp2_context {
     int id;
-    int V[2][2048];
+    short V[2][2048];
     int Voffs;
 } kjmp2v_context_t;
 
@@ -58,6 +66,25 @@ unsigned long kjmp2v_decode_frame_psg10(
     kjmp2v_context_t *mp2,
     const unsigned char *frame,
     kjmp2v_psg10_sample_t *out
+);
+
+/* Decode one frame of the FM TOWNS asset profile - MPEG-2 LSF, 16 kHz, mono,
+ * 32 kbit/s - straight to 1152 unsigned 8-bit samples, in the exact form the
+ * YM2612 channel-6 DAC register takes.  Returns the frame size in bytes, or 0
+ * if the frame is not that profile (callers wanting the general decoder should
+ * use kjmp2v_decode_frame_psg10 instead).  Passing out == NULL parses only the
+ * header.
+ *
+ * This is the fast path this project actually ships.  It differs from the
+ * PSG10 renderer in more than the output type: it applies the synthesis window
+ * with ten taps rather than sixteen, accumulates the taps without a per-tap
+ * rounding shift, and folds the output gain, DC offset and both scaling shifts
+ * into the window table, so one tap costs one multiply and one add.  See
+ * synth_window10_pcm8() for the measurements behind each of those. */
+unsigned long kjmp2v_decode_frame_pcm8(
+    kjmp2v_context_t *mp2,
+    const unsigned char *frame,
+    unsigned char *out
 );
 
 #endif

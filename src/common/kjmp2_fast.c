@@ -23,6 +23,21 @@
 
 #include "kjmp2_fast.h"
 
+/*
+ * Decoding one frame takes far longer than one output sample period, so on the
+ * FM TOWNS target the decoder is expected to service the DAC as it goes rather
+ * than run to completion and leave the output stalled meanwhile.  MP2_TICK()
+ * is placed at every point in the decode where the work since the previous
+ * tick is comfortably under one sample period; see dacout.h for the whole
+ * arrangement.  Host builds and any target without the hook compile it away.
+ */
+#ifdef FMT_MP2_DAC_TICK
+#include "dacout.h"
+#define MP2_TICK() fmt_dac_tick()
+#else
+#define MP2_TICK() ((void)0)
+#endif
+
 #ifndef MP2PSG_SAFE_CLIP
 #define MP2PSG_SAFE_CLIP 0
 #endif
@@ -407,14 +422,142 @@ static const short N[64][32] __attribute__((unused)) = {
     {-189, 152, 219,-109,-241,  62, 253, -12,-255, -37, 248,  86,-231,-131, 205, 171,-171,-205, 131, 231, -86,-248,  37, 255,  12,-253, -62, 241, 109,-219,-152, 189},
 };
 
+/* ------------------------------------------------------------------ *
+ * Ten-tap synthesis window, pre-folded for the 8-bit DAC output path.
+ *
+ * The full window is sixteen taps.  Decoding the whole 306-second asset at
+ * 16, 12, 10, 8, 6 and 4 taps and scoring each against ffmpeg's decode of the
+ * same file gives 24.17, 24.17, 24.16, 23.13, 22.14 and 16.03 dB SNR: the
+ * outermost taps are worth a hundredth of a dB, because D's first and last
+ * rows are two orders of magnitude below its centre rows and the DAC is only
+ * eight bits wide.  Ten taps is therefore free, and it removes 37.5% of the
+ * multiplies from what profiling shows is 82% of the decoder's arithmetic.
+ *
+ * win_voff/win_droff are the V and D offsets of the ten retained taps.  Both
+ * indices advance with the output index j, so win_d is stored tap-major: for
+ * a fixed tap, consecutive j walk consecutive words of both V and win_d,
+ * which is what lets the inner loop use pure sequential addressing.
+ *
+ * Folded into the table, once, at init:
+ *   - the negation, because every tap is subtracted;
+ *   - the x1.5 output gain (see MP2PSG_GAIN_NUM);
+ * leaving the per-sample tail as one shift, one add and one clamp.  The
+ * remaining >>19 is the window's own >>6, the group >>4, the PSG10 >>6 and
+ * the byte >>2 of the old chain, combined.
+ */
+#define WIN10_TAPS 10
+/* win_voff is used only by the portable fallback; the i386 kernel encodes the
+ * same offsets as instruction displacements. */
+static const short win_voff[WIN10_TAPS] __attribute__((unused)) =
+    { 224, 256, 352, 384, 480, 512, 608, 640, 736, 768 };
+static const short win_droff[WIN10_TAPS] =
+    {  96, 128, 160, 192, 224, 256, 288, 320, 352, 384 };
+static int win_d[WIN10_TAPS * 32];
+#define WIN10_SHIFT 19
+#define WIN10_ROUND (1 << (WIN10_SHIFT - 1))
+
 void kjmp2v_init(kjmp2v_context_t *mp2) {
     int i, j;
     initialized = 1;
+    for (i = 0; i < WIN10_TAPS; ++i)
+        for (j = 0; j < 32; ++j)
+            win_d[i * 32 + j] = -D[win_droff[i] + j] * MP2PSG_GAIN_NUM;
+    if (!mp2)
+        return;
     for (i = 0; i < 2; ++i)
         for (j = 2047; j >= 0; --j)
             mp2->V[i][j] = 0;
     mp2->Voffs = 0;
     mp2->id = KJMP2_MAGIC;
+}
+
+/*
+ * Apply the ten-tap window to one 32-sample synthesis group and emit the
+ * unsigned 8-bit DAC bytes.  `v` points at V[table_pos]; `dst` takes 32 bytes.
+ *
+ * This is the decoder's innermost loop: 11520 of the roughly 14000 multiplies
+ * in a frame happen here, so it is the one place hand-written assembly earns
+ * its keep.  gcc -march=i386 -Os already picks a good shape for the tap chain
+ * - two pointers walking V and win_d, ten unrolled taps - and win10_sample()
+ * keeps that.  What it changes is the multiply operand order.
+ *
+ * gcc emits `imull win_d(%edx),%eax` with the V sample in the register and the
+ * window coefficient as the memory source.  The 386's multiplier is data
+ * dependent, IMUL r32,r/m32 costing anywhere from 9 to 38 clocks, and it
+ * terminates early on the significant bits of the *source* operand - so that
+ * form makes it iterate over win_d's 18 bits when V has only nine (see the V
+ * range note in kjmp2_fast.h).  Loading the coefficient into a register and
+ * passing V as the source costs one extra mov per tap and moves each of the
+ * ten multiplies most of the way from the high end of that range to the low
+ * one.
+ *
+ * The per-tap `(x + 32) >> 6` of the original window is gone as well: probing
+ * the whole asset shows the products reach 25 bits and their ten-tap sum 29,
+ * so the accumulation cannot overflow a 32-bit register and the rounding
+ * shift only has to happen once, at the end.
+ *
+ * The clamp is left to the compiler as a pair of branches rather than made
+ * branchless: it is essentially never taken (the asset peaks at 113 of a
+ * possible 127 either side of the midpoint) and a not-taken 386 branch is
+ * cheaper than the sar/not pair that would replace it.
+ */
+#if defined(__i386__) && !defined(FMT_MP2_NO_ASM)
+/* One output sample's ten taps.  V displacements are 2*win_voff bytes,
+ * win_d displacements whole 32-int rows.  %1 and %2 are left to gcc to
+ * allocate and stay live across the enclosing loop, so the only per-sample
+ * address arithmetic is the loop's own increment. */
+#define WIN10_TAP(dv, dw) \
+    "movswl " #dv "(%1),%%ecx\n\t" \
+    "movl "   #dw "(%2),%%edx\n\t" \
+    "imull %%ecx,%%edx\n\t" \
+    "addl %%edx,%0\n\t"
+
+static inline int win10_sample(const short *v, const int *w)
+{
+    int acc;
+    __asm__ (
+        "movswl 448(%1),%%ecx\n\t"
+        "movl 0(%2),%0\n\t"
+        "imull %%ecx,%0\n\t"
+        WIN10_TAP ( 512,  128)
+        WIN10_TAP ( 704,  256)
+        WIN10_TAP ( 768,  384)
+        WIN10_TAP ( 960,  512)
+        WIN10_TAP (1024,  640)
+        WIN10_TAP (1216,  768)
+        WIN10_TAP (1280,  896)
+        WIN10_TAP (1472, 1024)
+        WIN10_TAP (1536, 1152)
+        : "=&r" (acc)
+        : "r" (v), "r" (w)
+        : "ecx", "edx", "cc");
+    return acc;
+}
+#else
+static inline int win10_sample(const short *v, const int *w)
+{
+    int k, acc = 0;
+    for (k = 0; k < WIN10_TAPS; ++k)
+        acc += (int)v[win_voff[k]] * w[k * 32];
+    return acc;
+}
+#endif
+
+static void FASTCALL synth_window10_pcm8(const short *v, unsigned char *dst)
+{
+    const int *w = win_d;
+    int j, pcm;
+
+    for (j = 0; j < 32; ++j, ++v, ++w) {
+        /* One sample of window is ~325 clocks on a 386SX, comfortably inside
+         * a 62.5us sample period, which is what makes this the right place
+         * for the DAC to be serviced from. */
+        MP2_TICK();
+        pcm = 128 + ((win10_sample(v, w) + WIN10_ROUND) >> WIN10_SHIFT);
+        if (pcm < 0) pcm = 0;
+        else if (pcm > 255) pcm = 255;
+        dst[j] = (unsigned char)pcm;
+    }
 }
 
 int kjmp2v_get_sample_rate(const unsigned char *frame) {
@@ -662,39 +805,51 @@ static void FASTCALL __attribute__((unused)) read_samples(const struct quantizer
     DCT_ADD(t,bb,dd); \
 } while (0)
 
+/* MP2_TICK() appears between the butterfly blocks below rather than only at
+ * the ends: the whole factorisation is about 3000 clocks on a 386SX, some
+ * fifty times a sample period, so a DCT run to completion between two DAC
+ * writes would be plainly audible.  Split eight ways it is well inside one. */
 static inline __attribute__((always_inline)) void FASTCALL synth_dct32_factored(int *t) {
+    MP2_TICK();
     DCT_BF(t,0,31,0,DCT_COS0_0,1);   DCT_BF(t,15,16,0,DCT_COS0_15,5);
     DCT_BF(t,0,15,0,DCT_COS1_0,1);   DCT_BF(t,16,31,1,DCT_COS1_0,1);
+    MP2_TICK();
     DCT_BF(t,7,24,0,DCT_COS0_7,1);   DCT_BF(t,8,23,0,DCT_COS0_8,1);
     DCT_BF(t,7,8,0,DCT_COS1_7,4);    DCT_BF(t,23,24,1,DCT_COS1_7,4);
     DCT_BF(t,0,7,0,DCT_COS2_0,1);    DCT_BF(t,16,23,0,DCT_COS2_0,1);
     DCT_BF(t,8,15,1,DCT_COS2_0,1);   DCT_BF(t,24,31,1,DCT_COS2_0,1);
+    MP2_TICK();
     DCT_BF(t,3,28,0,DCT_COS0_3,1);   DCT_BF(t,12,19,0,DCT_COS0_12,2);
     DCT_BF(t,3,12,0,DCT_COS1_3,1);   DCT_BF(t,19,28,1,DCT_COS1_3,1);
     DCT_BF(t,4,27,0,DCT_COS0_4,1);   DCT_BF(t,11,20,0,DCT_COS0_11,2);
     DCT_BF(t,4,11,0,DCT_COS1_4,1);   DCT_BF(t,20,27,1,DCT_COS1_4,1);
     DCT_BF(t,3,4,0,DCT_COS2_3,3);    DCT_BF(t,19,20,0,DCT_COS2_3,3);
     DCT_BF(t,11,12,1,DCT_COS2_3,3);  DCT_BF(t,27,28,1,DCT_COS2_3,3);
+    MP2_TICK();
     DCT_BF(t,0,3,0,DCT_COS3_0,1);    DCT_BF(t,8,11,0,DCT_COS3_0,1);
     DCT_BF(t,16,19,0,DCT_COS3_0,1);  DCT_BF(t,24,27,0,DCT_COS3_0,1);
     DCT_BF(t,4,7,1,DCT_COS3_0,1);    DCT_BF(t,12,15,1,DCT_COS3_0,1);
     DCT_BF(t,20,23,1,DCT_COS3_0,1);  DCT_BF(t,28,31,1,DCT_COS3_0,1);
+    MP2_TICK();
     DCT_BF(t,1,30,0,DCT_COS0_1,1);   DCT_BF(t,14,17,0,DCT_COS0_14,3);
     DCT_BF(t,1,14,0,DCT_COS1_1,1);   DCT_BF(t,17,30,1,DCT_COS1_1,1);
     DCT_BF(t,6,25,0,DCT_COS0_6,1);   DCT_BF(t,9,22,0,DCT_COS0_9,1);
     DCT_BF(t,6,9,0,DCT_COS1_6,2);    DCT_BF(t,22,25,1,DCT_COS1_6,2);
     DCT_BF(t,1,6,0,DCT_COS2_1,1);    DCT_BF(t,17,22,0,DCT_COS2_1,1);
     DCT_BF(t,9,14,1,DCT_COS2_1,1);   DCT_BF(t,25,30,1,DCT_COS2_1,1);
+    MP2_TICK();
     DCT_BF(t,2,29,0,DCT_COS0_2,1);   DCT_BF(t,13,18,0,DCT_COS0_13,3);
     DCT_BF(t,2,13,0,DCT_COS1_2,1);   DCT_BF(t,18,29,1,DCT_COS1_2,1);
     DCT_BF(t,5,26,0,DCT_COS0_5,1);   DCT_BF(t,10,21,0,DCT_COS0_10,1);
     DCT_BF(t,5,10,0,DCT_COS1_5,2);   DCT_BF(t,21,26,1,DCT_COS1_5,2);
     DCT_BF(t,2,5,0,DCT_COS2_2,1);    DCT_BF(t,18,21,0,DCT_COS2_2,1);
     DCT_BF(t,10,13,1,DCT_COS2_2,1);  DCT_BF(t,26,29,1,DCT_COS2_2,1);
+    MP2_TICK();
     DCT_BF(t,1,2,0,DCT_COS3_1,2);    DCT_BF(t,9,10,0,DCT_COS3_1,2);
     DCT_BF(t,17,18,0,DCT_COS3_1,2);  DCT_BF(t,25,26,0,DCT_COS3_1,2);
     DCT_BF(t,5,6,1,DCT_COS3_1,2);    DCT_BF(t,13,14,1,DCT_COS3_1,2);
     DCT_BF(t,21,22,1,DCT_COS3_1,2);  DCT_BF(t,29,30,1,DCT_COS3_1,2);
+    MP2_TICK();
     DCT_BF1(t,0,1,2,3);              DCT_BF2(t,4,5,6,7);
     DCT_BF1(t,8,9,10,11);            DCT_BF2(t,12,13,14,15);
     DCT_BF1(t,16,17,18,19);          DCT_BF2(t,20,21,22,23);
@@ -703,6 +858,7 @@ static inline __attribute__((always_inline)) void FASTCALL synth_dct32_factored(
 
 static inline __attribute__((always_inline)) void FASTCALL synth_dct32_output_order(int *t) {
     int o[32];
+    MP2_TICK();
     int k;
 #define DCT_OUT(dst,src0,src1,src2,src3,src2a,src13a,src13b) do { \
     int r1 = t[(src0)]; \
@@ -727,7 +883,7 @@ static inline __attribute__((always_inline)) void FASTCALL synth_dct32_output_or
     for (k = 0; k < 32; ++k) t[k] = o[k];
 }
 
-static void FASTCALL synth_dct32_to_v(int *vbase, int vpos, const int *sx) {
+static void FASTCALL synth_dct32_to_v(short *vbase, int vpos, const int *sx) {
     int d[32];
     int i, a, b, sumx;
 
@@ -953,7 +1109,7 @@ static unsigned long decode_frame_psg10_mono16_fast(
                 synth_dct32_to_v(&mp2->V[0][0], table_pos, &sample_mono17[0][idx]);
 
                 for (j = 0; j < 32; ++j) {
-                    const int *vv = &mp2->V[0][table_pos + j];
+                    const short *vv = &mp2->V[0][table_pos + j];
                     sum = -WIN_TAP(vv,   0,        j)
                           -WIN_TAP(vv,  96,   32 + j)
                           -WIN_TAP(vv, 128,   64 + j)
@@ -986,6 +1142,132 @@ static unsigned long decode_frame_psg10_mono16_fast(
 }
 
 
+
+/*
+ * FM TOWNS output path: same profile as decode_frame_psg10_mono16_fast (MPEG-2
+ * LSF, 16 kHz, mono, 32 kbit/s), but written for the YM2612 channel-6 DAC
+ * instead of the PC-FX PSG.
+ *
+ * The PSG10 renderer packs each sample into a 32-bit word that the caller then
+ * shifts back down to eight bits.  For this target that is 4608 bytes of
+ * store traffic and 1152 shifts per frame in aid of nothing, so this path
+ * writes the DAC byte directly - a quarter of the stores, and it lets the
+ * streaming ring hold four times as much audio for the same RAM.
+ */
+static unsigned long decode_frame_pcm8_mono16_fast(
+    kjmp2v_context_t *mp2,
+    const unsigned char *frame,
+    unsigned char *pcm
+) {
+    unsigned bit_rate_index;
+    unsigned sampling_frequency;
+    unsigned padding_bit;
+    unsigned mode;
+    unsigned long frame_size;
+    const unsigned char *br_pos;
+    int br_window;
+    int br_bits;
+    unsigned qidx;
+    int sb, gr, part, idx;
+    int table_pos;
+
+    if (!initialized || !mp2 || (mp2->id != KJMP2_MAGIC) || !frame)
+        return 0;
+
+    if ((frame[0] != 0xFF) || ((frame[1] & 0xF6) != 0xF4))
+        return 0;
+
+    bit_rate_index = (unsigned)((frame[2] >> 4) & 15);
+    sampling_frequency = (unsigned)((frame[2] >> 2) & 3);
+    padding_bit = (unsigned)((frame[2] >> 1) & 1);
+    mode = (unsigned)((frame[3] >> 6) & 3);
+
+    if ((frame[1] & 0x08) || bit_rate_index != 4u || sampling_frequency != 2u || mode != MONO)
+        return 0;
+
+    br_pos = (frame[1] & 1) ? &frame[4] : &frame[6];
+    br_window = ((int)br_pos[0] << 16) | ((int)br_pos[1] << 8) | (int)br_pos[2];
+    br_bits = 24;
+    br_pos += 3;
+
+    frame_size = 288u + padding_bit;
+    if (!pcm)
+        return frame_size;
+
+    for (sb = 0; sb < 4; ++sb) {
+        qidx = (unsigned)quant_lut_step4[5][BR_GET_LOCAL(4)];
+        if (!qidx) return 0;
+        allocation_mono17[sb] = &quantizer_table[qidx - 1];
+    }
+    for (; sb < 11; ++sb) {
+        qidx = (unsigned)quant_lut_step4[4][BR_GET_LOCAL(3)];
+        if (!qidx) return 0;
+        allocation_mono17[sb] = &quantizer_table[qidx - 1];
+    }
+    for (; sb < 17; ++sb) {
+        qidx = (unsigned)quant_lut_step4[4][BR_GET_LOCAL(2)];
+        if (!qidx) return 0;
+        allocation_mono17[sb] = &quantizer_table[qidx - 1];
+    }
+    for (sb = 17; sb < 30; ++sb) {
+        if (BR_GET_LOCAL(2)) return 0;
+    }
+
+    for (sb = 0; sb < 17; ++sb)
+        scfsi_mono17[sb] = BR_GET_LOCAL(2);
+
+    for (sb = 0; sb < 17; ++sb) {
+        MP2_TICK();
+        switch (scfsi_mono17[sb]) {
+            case 0:
+                scalefactor_mono17[sb][0] = BR_GET_LOCAL(6);
+                scalefactor_mono17[sb][1] = BR_GET_LOCAL(6);
+                scalefactor_mono17[sb][2] = BR_GET_LOCAL(6);
+                break;
+            case 1:
+                scalefactor_mono17[sb][0] = scalefactor_mono17[sb][1] = BR_GET_LOCAL(6);
+                scalefactor_mono17[sb][2] = BR_GET_LOCAL(6);
+                break;
+            case 2:
+                scalefactor_mono17[sb][0] = scalefactor_mono17[sb][1] =
+                scalefactor_mono17[sb][2] = BR_GET_LOCAL(6);
+                break;
+            default:
+                scalefactor_mono17[sb][0] = BR_GET_LOCAL(6);
+                scalefactor_mono17[sb][1] = scalefactor_mono17[sb][2] = BR_GET_LOCAL(6);
+                break;
+        }
+    }
+
+    for (part = 0; part < 3; ++part) {
+        for (gr = 0; gr < 4; ++gr) {
+            for (sb = 0; sb < 17; ++sb) {
+                /* One requantised triplet is ~360 clocks - a tick apiece
+                 * keeps this loop under a sample period too. */
+                MP2_TICK();
+                READ_SAMPLES_LOCAL(allocation_mono17[sb], scalefactor_mono17[sb][part], &sample_mono17[sb][0]);
+            }
+
+            for (idx = 0; idx < 3; ++idx) {
+                mp2->Voffs = table_pos = (mp2->Voffs - 64) & 1023;
+                synth_dct32_to_v(&mp2->V[0][0], table_pos, &sample_mono17[0][idx]);
+                synth_window10_pcm8(&mp2->V[0][table_pos], pcm + (idx << 5));
+            }
+            pcm += 96;
+        }
+    }
+
+    return frame_size;
+}
+
+unsigned long kjmp2v_decode_frame_pcm8(
+    kjmp2v_context_t *mp2,
+    const unsigned char *frame,
+    unsigned char *out
+) {
+    if (!frame) return 0;
+    return decode_frame_pcm8_mono16_fast(mp2, frame, out);
+}
 
 /* Dedicated profile for 22.05 kHz / 64 kbit/s / stereo MP2.
  * Intended for four PSG DDA channels: L high/low + R high/low.
@@ -1108,8 +1390,8 @@ static unsigned long decode_frame_psg10_stereo16_fast(
                 synth_dct32_to_v(&mp2->V[0][0], table_pos, &sample_st16[0][0][idx]);
                 synth_dct32_to_v(&mp2->V[1][0], table_pos, &sample_st16[1][0][idx]);
                 for (j = 0; j < 32; ++j) {
-                    const int *v0 = &mp2->V[0][table_pos + j];
-                    const int *v1 = &mp2->V[1][table_pos + j];
+                    const short *v0 = &mp2->V[0][table_pos + j];
+                    const short *v1 = &mp2->V[1][table_pos + j];
                     kjmp2v_psg10_code_t c0, c1;
                     sum0 = STEREO_WIN_SUM(v0, j);
                     sum1 = STEREO_WIN_SUM(v1, j);
@@ -1236,8 +1518,8 @@ static unsigned long decode_frame_psg10_stereo22_fast(
                 synth_dct32_to_v(&mp2->V[0][0], table_pos, &sample_st16[0][0][idx]);
                 synth_dct32_to_v(&mp2->V[1][0], table_pos, &sample_st16[1][0][idx]);
                 for (j = 0; j < 32; ++j) {
-                    const int *v0 = &mp2->V[0][table_pos + j];
-                    const int *v1 = &mp2->V[1][table_pos + j];
+                    const short *v0 = &mp2->V[0][table_pos + j];
+                    const short *v1 = &mp2->V[1][table_pos + j];
                     kjmp2v_psg10_code_t c0, c1;
                     sum0 = STEREO_WIN_SUM(v0, j);
                     sum1 = STEREO_WIN_SUM(v1, j);
@@ -1262,7 +1544,7 @@ static int scfsi_g[2][32];
 static int scalefactor_g[2][32][3];
 static int sample_g[2][32][3];
 
-static void FASTCALL synth_dct32_to_v_stride(int *vbase, int vpos, const int *sx, int stride) {
+static void FASTCALL synth_dct32_to_v_stride(short *vbase, int vpos, const int *sx, int stride) {
     int d[32];
     int i, a, b, sumx;
     for (i = 0; i < 32; ++i) d[i] = sx[i * stride];
@@ -1468,7 +1750,7 @@ static unsigned long decode_frame_psg10_generic(
                 if (nch == 2)
                     synth_dct32_to_v_stride(&mp2->V[1][0], table_pos, &sample_g[1][0][idx], 3);
                 for (j = 0; j < 32; ++j) {
-                    const int *v0 = &mp2->V[0][table_pos + j];
+                    const short *v0 = &mp2->V[0][table_pos + j];
                     sum0 = -WIN_TAP(v0,   0,        j)
                            -WIN_TAP(v0,  96,   32 + j)
                            -WIN_TAP(v0, 128,   64 + j)
@@ -1487,7 +1769,7 @@ static unsigned long decode_frame_psg10_generic(
                            -WIN_TAP(v0, 992,  480 + j);
                     sum0 = (sum0 + 8) >> 4;
                     if (nch == 2) {
-                        const int *v1 = &mp2->V[1][table_pos + j];
+                        const short *v1 = &mp2->V[1][table_pos + j];
                         kjmp2v_psg10_code_t c0, c1;
                         sum1 = -WIN_TAP(v1,   0,        j)
                                -WIN_TAP(v1,  96,   32 + j)

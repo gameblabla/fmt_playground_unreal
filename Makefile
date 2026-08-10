@@ -33,7 +33,7 @@ MP2_ASSET       = CD/MUSIC.MP2
 OBJS            = src/boot/head.o src/boot/reloc.o src/boot/assets.o src/main.o \
                   src/common/common.o src/common/palette.o src/common/libfmt.o src/common/pad.o \
                   src/common/fmt_layers.o src/common/fmt_sprite.o \
-                  src/common/cdrom.o src/common/sound.o src/common/iso9660.o src/common/pcmstream.o src/common/mp2.o src/common/mp2_fast.o src/common/kjmp2_fast.o src/common/mp2stream.o \
+                  src/common/cdrom.o src/common/sound.o src/common/iso9660.o src/common/pcmstream.o src/common/dacout.o src/common/mp2.o src/common/mp2_fast.o src/common/kjmp2_fast.o src/common/mp2stream.o \
                   src/common/cdda.o src/common/vgmplay.o
 
 IPLBIN          = IPL.BIN
@@ -158,10 +158,15 @@ src/common/mp2.o: src/common/mp2.c src/common/mp2.h build/mp2_synth_table.h buil
 src/common/mp2_fast.o: src/common/mp2_fast.S
 	$(AS) -o $@ $<
 
-src/common/kjmp2_fast.o: src/common/kjmp2_fast.c src/common/kjmp2_fast.h
-	$(CC) -c $(CFLAGS) -o $@ src/common/kjmp2_fast.c
+src/common/dacout.o: src/common/dacout.c src/common/dacout.h
+	$(CC) -c $(CFLAGS) -o $@ src/common/dacout.c
 
-src/common/mp2stream.o: src/common/mp2stream.c src/common/mp2stream.h src/common/mp2.h src/common/cdrom.h src/common/iso9660.h
+# FMT_MP2_DAC_TICK makes the decoder service the DAC from inside its inner
+# loops instead of stalling the output for the length of a frame decode.
+src/common/kjmp2_fast.o: src/common/kjmp2_fast.c src/common/kjmp2_fast.h src/common/dacout.h
+	$(CC) -c $(CFLAGS) -DFMT_MP2_DAC_TICK -o $@ src/common/kjmp2_fast.c
+
+src/common/mp2stream.o: src/common/mp2stream.c src/common/mp2stream.h src/common/mp2.h src/common/cdrom.h src/common/iso9660.h src/common/dacout.h
 	$(CC) -c $(CFLAGS) -o $@ src/common/mp2stream.c
 
 src/common/cdda.o: src/common/cdda.c src/common/cdda.h src/common/cdrom.h
@@ -183,8 +188,38 @@ clean:
 	rm -f src/boot/*.o src/boot/*.s src/common/*.o src/*.o \
 		mygame_shared mygame_shared.bin CD/SYSTEM.BIN $(IPLBIN) BOOT.BIN \
 		src/common/pad.o src/common/scsi.o src/common/cdrom.o src/common/sound.o \
-		src/common/iso9660.o src/common/pcmstream.o src/common/cdda.o
+		src/common/iso9660.o src/common/pcmstream.o src/common/dacout.o src/common/cdda.o
 	@rm -f $(VGM_ASSET) $(MP2_ASSET) src/common/vgmplay.o src/common/mp2.o src/common/mp2_fast.o src/common/mp2stream.o
 	@rm -f build/*.spr build/*.h
 
-.PHONY: all clean
+# ---------------------------------------------------------------------
+# Host-side tests.  These build for the host, not the target: the point is
+# to check the parts that are pure computation (the decoder) and pure
+# arithmetic (the DAC pacing) without needing a Marty in the loop.
+# ---------------------------------------------------------------------
+HOSTCC          = gcc
+TESTFLAGS       = -O2 -Wall -Isrc/common
+# The decoder tests build 32-bit so the i386 window kernel is the code
+# actually under test, and are compiled -march=i386 like the target.
+TEST32FLAGS     = -m32 -march=i386 -Os -fomit-frame-pointer -Wall -Isrc/common
+
+test: $(MP2_ASSET)
+	@mkdir -p build
+	@echo "== DAC pacing =="
+	$(HOSTCC) $(TESTFLAGS) -Itests/hostio -o build/t_dacpace \
+		tests/dacpace_test.c src/common/dacout.c
+	@build/t_dacpace
+	@echo
+	@echo "== MP2 decoder: i386 window kernel vs portable C =="
+	$(HOSTCC) $(TEST32FLAGS) -o build/t_mp2_asm tests/mp2_pcm8_test.c src/common/kjmp2_fast.c
+	$(HOSTCC) $(TEST32FLAGS) -DFMT_MP2_NO_ASM -o build/t_mp2_c tests/mp2_pcm8_test.c src/common/kjmp2_fast.c
+	@build/t_mp2_asm $(MP2_ASSET) build/asm.u8
+	@build/t_mp2_c   $(MP2_ASSET) build/c.u8
+	@cmp build/asm.u8 build/c.u8 && echo "inline asm output is byte-identical to the C reference"
+	@echo
+	@echo "== decode/playback interleaving =="
+	$(HOSTCC) $(TESTFLAGS) -Itests/hostio -DFMT_MP2_DAC_TICK -o build/t_interleave \
+		tests/mp2_interleave_test.c src/common/kjmp2_fast.c src/common/dacout.c
+	@build/t_interleave $(MP2_ASSET)
+
+.PHONY: all clean test
