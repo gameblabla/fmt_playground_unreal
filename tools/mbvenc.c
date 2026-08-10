@@ -56,6 +56,11 @@ static int   opt_budget = 5000;       /* bytes/frame for inter frames */
 static int   opt_key_budget = 20000;  /* bytes/frame for keyframes */
 static int   opt_max_chunk = 30000;   /* hard ceiling; must fit the player's scratch */
 static int   opt_search = 8;          /* motion search radius, in pixels */
+/* Squared RGB distance under which a new palette entry is replaced by the one
+ * already in that slot - see align_palette().  6 levels per channel is below
+ * what is visible in a 256-colour picture and turns most of a keyframe's
+ * palette into entries the player does not have to write at all. */
+static int   opt_pal_snap = 3 * 6 * 6;
 static int   opt_quiet = 0;
 static const char *opt_dump = NULL;    /* reconstruction dump, for the tests */
 
@@ -69,6 +74,7 @@ static uint8_t *g_target;     /* current frame quantised to the palette */
 static uint8_t *g_recon;      /* the reconstruction, decoder-identical */
 static uint8_t *g_recon_save; /* copy taken at frame start, for retries */
 static uint8_t  g_pal[768];
+static uint8_t  g_prev_pal[768];   /* the GOP before's, for align_palette() */
 static uint32_t (*g_dist)[PAL_SIZE];   /* squared RGB distance between entries */
 static uint8_t *g_map15;      /* RGB555 -> nearest palette index */
 
@@ -104,6 +110,18 @@ typedef struct {
 } box_t;
 
 static int g_sort_axis;
+
+/* One candidate (old slot, new colour) binding for align_palette() below. */
+typedef struct {
+    uint32_t d;
+    uint16_t old_i, new_i;
+} pair_t;
+
+static int pair_cmp(const void *a, const void *b)
+{
+    uint32_t da = ((const pair_t *)a)->d, db = ((const pair_t *)b)->d;
+    return da < db ? -1 : (da > db ? 1 : 0);
+}
 
 static int cell_cmp(const void *a, const void *b)
 {
@@ -251,6 +269,65 @@ static void build_palette(const uint8_t *frames, int nframes)
         g_pal[i * 3 + 1] = (uint8_t)(sg / n);
         g_pal[i * 3 + 2] = (uint8_t)(sb / n);
     }
+}
+
+/*
+ * Renumbers a freshly built palette so that each entry sits at the slot held
+ * by the nearest colour in the palette before it.
+ *
+ * The permutation is free - indices are assigned before the GOP is encoded, so
+ * any ordering is as good as any other to the codec - but it is worth a lot at
+ * playback time.  The palette can only change on a keyframe, and the machine
+ * has about 1.4ms of vertical blanking in which to change it before the CRTC
+ * starts scanning the frame out and a further write recolours whatever is left
+ * on screen.  Writing all 256 entries does not fit in that window.
+ *
+ * Aligning consecutive palettes means most slots end up holding exactly the
+ * colour they already held, so the player (see upload_palette() in
+ * mbvplay.c) has only a handful of entries to write and finishes well inside
+ * the blanking interval.  The entries that do move, move to a near neighbour,
+ * so even a palette large enough to overrun the window degrades into a barely
+ * perceptible shift rather than a flash of wrong colours.
+ *
+ * Greedy nearest-pair matching: take the closest (old slot, new colour) pair
+ * still unclaimed, bind it, repeat.  256 slots makes this 65536 pairs, which
+ * at encode time is nothing.
+ */
+static void align_palette(const uint8_t *prev, uint8_t *pal)
+{
+    static pair_t pairs[PAL_SIZE * PAL_SIZE];
+    uint8_t out[768];
+    uint8_t old_taken[PAL_SIZE], new_taken[PAL_SIZE];
+    int i, j, n = 0, bound = 0;
+
+    for (i = 0; i < PAL_SIZE; i++) {
+        for (j = 0; j < PAL_SIZE; j++) {
+            int dr = prev[i * 3 + 0] - pal[j * 3 + 0];
+            int dg = prev[i * 3 + 1] - pal[j * 3 + 1];
+            int db = prev[i * 3 + 2] - pal[j * 3 + 2];
+            pairs[n].d = (uint32_t)(dr * dr + dg * dg + db * db);
+            pairs[n].old_i = (uint16_t)i;
+            pairs[n].new_i = (uint16_t)j;
+            n++;
+        }
+    }
+    qsort(pairs, (size_t)n, sizeof(pair_t), pair_cmp);
+
+    memset(old_taken, 0, sizeof(old_taken));
+    memset(new_taken, 0, sizeof(new_taken));
+    for (i = 0; i < n && bound < PAL_SIZE; i++) {
+        int oi = pairs[i].old_i, ni = pairs[i].new_i;
+        if (old_taken[oi] || new_taken[ni]) {
+            continue;
+        }
+        old_taken[oi] = new_taken[ni] = 1;
+        /* Close enough to what the slot already holds?  Then keep the old
+         * colour exactly, so the entry needs no write at playback time. */
+        memcpy(out + oi * 3, pairs[i].d <= (uint32_t)opt_pal_snap
+                             ? prev + oi * 3 : pal + ni * 3, 3);
+        bound++;
+    }
+    memcpy(pal, out, 768);
 }
 
 static void build_tables(void)
@@ -938,6 +1015,10 @@ static void usage(void)
 "  -k N     byte budget per keyframe (default 20000)\n"
 "  -m N     hard chunk ceiling in bytes (default 30000)\n"
 "  -s N     motion search radius in pixels, 0 disables (default 8)\n"
+"  -p N     palette snap threshold, squared RGB distance (default 108,\n"
+"           0 disables): how close a new palette entry has to be to the\n"
+"           one already in its slot to be replaced by it, so that the\n"
+"           player need not rewrite that entry at a keyframe\n"
 "  -D FILE  dump the encoder's reconstruction (768-byte palette plus one\n"
 "           byte per pixel, per frame) for tests/mbv_roundtrip_test.c\n"
 "  -q       quiet\n");
@@ -979,6 +1060,7 @@ int main(int argc, char **argv)
         case 'm': opt_max_chunk = atoi(argv[++i]); break;
         case 's': opt_search = atoi(argv[++i]); break;
         case 'D': opt_dump = argv[++i]; break;
+        case 'p': opt_pal_snap = atoi(argv[++i]); break;
         default: usage();
         }
     }
@@ -1056,6 +1138,10 @@ int main(int argc, char **argv)
             }
             fseek(vf, (long)(frame * frame_rgb), SEEK_SET);
             build_palette(g_rgb, (int)n);
+            if (frame != 0) {
+                align_palette(g_prev_pal, g_pal);
+            }
+            memcpy(g_prev_pal, g_pal, sizeof(g_prev_pal));
             build_tables();
         }
         got = fread(g_rgb, 1, frame_rgb, vf);

@@ -50,7 +50,11 @@ static uint8_t g_audio[2][MBV_AUDIO_MAX];
  *  12  bytes consumed from the stream
  *  16  DAC underruns
  *  20  streaming reader state (FMT_CD_STREAM_*)
- *  24  0xA5A5A5A5 trailer
+ *  24  vertical blanking interval, microseconds (measured once at startup)
+ *  28  palette entries written on the last keyframe
+ *  32  microseconds that upload took
+ *  36  worst palette upload seen, microseconds
+ *  40  0xA5A5A5A5 trailer
  */
 #ifdef FMT_MBV_STATS
 #define MBV_STATS ((volatile uint32_t *)0x00100000u)
@@ -61,6 +65,7 @@ static uint8_t g_audio[2][MBV_AUDIO_MAX];
 #define MBV_STAGE_PLAYING   5u
 #define MBV_STAGE_DONE      6u
 static uint32_t g_stat_stage, g_stat_frames, g_stat_pos;
+static uint32_t g_stat_vblank, g_stat_pal_n, g_stat_pal_us, g_stat_pal_worst;
 static void mbv_stats(const fmt_cd_stream *cd)
 {
     MBV_STATS[0] = 0x5356424du;    /* "MBVS" */
@@ -69,15 +74,31 @@ static void mbv_stats(const fmt_cd_stream *cd)
     MBV_STATS[3] = g_stat_pos;
     MBV_STATS[4] = fmt_dac.underruns;
     MBV_STATS[5] = cd ? cd->state : 0xffffffffu;
-    MBV_STATS[6] = 0xA5A5A5A5u;
+    MBV_STATS[6] = g_stat_vblank;
+    MBV_STATS[7] = g_stat_pal_n;
+    MBV_STATS[8] = g_stat_pal_us;
+    MBV_STATS[9] = g_stat_pal_worst;
+    MBV_STATS[10] = 0xA5A5A5A5u;
 }
+#define MBV_STAT_PAL(n, us) do { \
+    g_stat_pal_n = (n); g_stat_pal_us = (us); \
+    if ((us) > g_stat_pal_worst) g_stat_pal_worst = (us); } while (0)
+#define MBV_STAT_VBLANK(us) do { g_stat_vblank = (us); } while (0)
 #define MBV_STAGE(s, cd)  do { g_stat_stage = (s); mbv_stats(cd); } while (0)
 #define MBV_PROGRESS(f, p, cd) \
     do { g_stat_frames = (f); g_stat_pos = (p); mbv_stats(cd); } while (0)
 #else
 #define MBV_STAGE(s, cd)        ((void)0)
 #define MBV_PROGRESS(f, p, cd)  ((void)0)
+#define MBV_STAT_PAL(n, us)     ((void)0)
+#define MBV_STAT_VBLANK(us)     ((void)0)
 #endif
+
+/* CRTC status register, read after selecting register 30 - libfmt's
+ * fmt_wait_vsync() uses the same pair.  Bit 2 is asserted for the duration of
+ * the vertical blanking interval. */
+#define MBV_CRTC_STATUS     0x443
+#define MBV_CRTC_VSYNC_BIT  0x04
 
 static fmt_mbv_info g_info;
 static fmt_mbv_dec  g_dec;
@@ -170,27 +191,118 @@ static int chunk_at(fmt_cd_stream *cd, uint32_t pos,
     return 1;
 }
 
-static void upload_palette(void)
+/*
+ * Getting a new palette in without a visible glitch.
+ *
+ * The palette DAC is consulted per pixel as the CRTC scans out, so an entry
+ * written after the vertical blanking interval has ended recolours the rest of
+ * that frame, from the current raster line down.  The window is not large: in
+ * this mode the CRTC's VDS0 puts the first displayed line 70 half-lines into a
+ * 1050 half-line frame, which at 31.5kHz is 1.11ms from the vertical sync
+ * edge fmt_flip_page() returns on.  (The sync pulse itself, VST1..VST2, is
+ * only 64us - measured at 59us, MBV_STATS[6] - so waiting for the pulse to
+ * end would leave nothing.)
+ *
+ * A keyframe can change the whole palette, and 256 entries written one by one
+ * with a DAC tick between each came to roughly a millisecond: right at the
+ * edge of that window, over it often enough to show up as reported - a brief
+ * wrong-colour flash, at a GOP boundary.
+ *
+ * Three things keep the upload inside the interval:
+ *
+ *   - Only entries that actually differ from what the DAC already holds are
+ *     written.  g_pal_shadow tracks that.  The encoder deliberately keeps
+ *     palettes aligned across GOP boundaries and snaps near-identical entries
+ *     to the ones already there (align_palette() in tools/mbvenc.c), so a
+ *     keyframe within a scene now changes tens of entries rather than 256.
+ *   - Working out *which* entries changed is done before the flip, not after
+ *     it.  Comparing all 256 costs a couple of hundred microseconds, and
+ *     there is no reason to spend them inside the one window that matters
+ *     when there are 80ms of frame either side of it.
+ *   - The DAC is serviced every eight entries instead of every one.  Eight
+ *     entries is 32 port writes, comfortably inside the 62.5us sample period,
+ *     and it keeps ~250 timer reads out of the critical window.
+ *   - The upload is measured against the free-running 1us counter and
+ *     published (MBV_STATS[7..9]) so this stays a fact rather than a hope.
+ *     Measured on sailor.mkv: 115us for a 45-entry keyframe, 258us for 101
+ *     entries, and 653us for the one scene cut that replaces all 256 - all
+ *     inside the 1.11ms available, the worst case with 40% to spare.
+ *
+ * A scene cut that genuinely replaces all 256 entries still writes all of
+ * them rather than stopping at the window's edge and finishing next frame:
+ * running a little long costs one frame with a seam in it, whereas deferring
+ * would leave the whole picture in the wrong colours for a further 83ms.
+ */
+static uint8_t g_pal_shadow[768];
+static uint8_t g_pal_pending[256];
+static unsigned g_pal_pending_n;
+static uint8_t g_pal_shadow_valid;
+
+/* Works out what will have to be written, outside the window where writing it
+ * matters.  Called before the blit; upload_palette() is called after the flip
+ * and does nothing but the port writes. */
+static void prepare_palette(void)
 {
     unsigned i;
 
-    for (i = 0; i < 256u; i++) {
-        set_palette((uint8_t)i, g_dec.pal[i * 3], g_dec.pal[i * 3 + 1],
-                    g_dec.pal[i * 3 + 2]);
-        fmt_dac_tick();
+    g_pal_pending_n = 0;
+    if (!g_dec.pal_dirty) {
+        return;
     }
+    for (i = 0; i < 256u; i++) {
+        const uint8_t *e = g_dec.pal + i * 3;
+        uint8_t *s = g_pal_shadow + i * 3;
+
+        if (g_pal_shadow_valid && s[0] == e[0] && s[1] == e[1] && s[2] == e[2]) {
+            continue;
+        }
+        s[0] = e[0];
+        s[1] = e[1];
+        s[2] = e[2];
+        g_pal_pending[g_pal_pending_n++] = (uint8_t)i;
+        if ((g_pal_pending_n & 31u) == 0u) {
+            fmt_dac_tick();
+        }
+    }
+    g_pal_shadow_valid = 1;
+}
+
+static void upload_palette(void)
+{
+    unsigned i;
+#ifdef FMT_MBV_STATS
+    uint16_t t0 = inw(FMT_DAC_FREERUN_TIMER);
+#endif
+
+    for (i = 0; i < g_pal_pending_n; i++) {
+        unsigned c = g_pal_pending[i];
+        const uint8_t *e = g_pal_shadow + c * 3;
+
+        set_palette((uint8_t)c, e[0], e[1], e[2]);
+        if ((i & 7u) == 7u) {
+            fmt_dac_tick();
+        }
+    }
+    MBV_STAT_PAL(g_pal_pending_n,
+                 (uint32_t)(uint16_t)(inw(FMT_DAC_FREERUN_TIMER) - t0));
+    g_pal_pending_n = 0;
+    fmt_dac_tick();
 }
 
 /* Blit the decoded frame into the page being drawn, show it, then apply any
- * new palette.  Order matters: a keyframe's palette belongs to the picture
- * that arrives with it, and loading it before the flip would apply it to the
- * frame still on screen for one frame's worth of wrong colours. */
+ * new palette.  Order matters twice over: a keyframe's palette belongs to the
+ * picture that arrives with it, so loading it before the flip would apply it
+ * to the frame still on screen; and the flip returns at the leading edge of
+ * the vertical blank, which is the only part of the frame where the palette
+ * can be changed unseen - so the upload goes here, immediately after it, and
+ * nothing else is allowed in between. */
 static void present(void)
 {
+    prepare_palette();
     fmt_mbv_blit((volatile uint8_t *)FMT_VRAM0_BASE, g_fmt_draw_buffer_offset,
                  g_frame, (uint32_t)g_info.width * g_info.height);
     fmt_flip_page_poll(poll_dac);
-    if (g_dec.pal_dirty) {
+    if (g_pal_pending_n) {
         upload_palette();
     }
 }
@@ -214,6 +326,22 @@ static uint16_t take_audio(const uint8_t *audio, uint16_t alen, uint8_t *dst)
     return alen;
 }
 
+#ifdef FMT_MBV_STATS
+/* How much blanking there actually is to spend on the palette, measured
+ * rather than derived from the CRTC numbers.  Runs once, before any audio is
+ * playing, so blocking here costs nothing. */
+static void measure_vblank(void)
+{
+    uint16_t t0;
+
+    fmt_wait_vsync();              /* returns at the leading edge */
+    t0 = inw(FMT_DAC_FREERUN_TIMER);
+    while (inb(MBV_CRTC_STATUS) & MBV_CRTC_VSYNC_BIT) {
+    }
+    MBV_STAT_VBLANK((uint32_t)(uint16_t)(inw(FMT_DAC_FREERUN_TIMER) - t0));
+}
+#endif
+
 int fmt_mbv_stream_play(void)
 {
     fmt_cd_stream cd;
@@ -234,6 +362,11 @@ int fmt_mbv_stream_play(void)
         return -1;
     }
     fmt_mbv_dec_init(&g_dec, &g_info, g_frame, g_info.width);
+    g_pal_shadow_valid = 0;
+    g_pal_pending_n = 0;
+#ifdef FMT_MBV_STATS
+    measure_vblank();
+#endif
     MBV_STAGE(MBV_STAGE_MODE, (fmt_cd_stream *)0);
 
     fmt_cdrom_stream_init(&cd, g_lba, g_size, g_ring, MBV_RING, 0);

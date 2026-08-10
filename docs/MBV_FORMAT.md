@@ -146,6 +146,39 @@ anyway, so no block can reference indices from the old palette. Keeping the
 palette still between keyframes is what avoids the flicker that per-frame
 quantisation produces, and it means most frames spend nothing on colour at all.
 
+### Getting a new palette in without a visible glitch
+
+The palette DAC is consulted per pixel as the CRTC scans out, so an entry
+written after the blanking interval recolours the rest of that frame from the
+current raster line down. There is not much interval: in this mode `VDS0` puts
+the first displayed line 70 half-lines into a 1050 half-line frame, i.e.
+**1.11ms** after the vertical sync edge `fmt_flip_page()` returns on. (The sync
+pulse itself is only 64us, so waiting for it to end would leave nothing.)
+Writing all 256 entries one at a time with a DAC tick between each came to
+about a millisecond - right at the edge, and over it often enough to show as a
+brief wrong-colour flash at a GOP boundary.
+
+Both ends of the pipeline now work to keep the upload small:
+
+* **The encoder renumbers each new palette** so every entry sits in the slot
+  held by the nearest colour of the previous palette, and replaces entries that
+  land within `-p` (default 108, squared RGB distance - about 6 levels per
+  channel) of what is already there with that existing colour exactly. The
+  permutation is free, because indices are assigned before the GOP is encoded.
+  Cost is under 0.05 dB.
+* **The player keeps a shadow of what the DAC holds** and writes only the
+  entries that differ, works out *which* ones before the flip rather than
+  inside the window, and ticks the DAC every eight entries instead of every
+  one.
+
+On `sailor.mkv` that takes an ordinary keyframe from 256 entries and ~1ms to
+45-101 entries and **115-258us**. The one genuine scene cut still replaces all
+256, in **653us** - still inside the 1.11ms, with 40% to spare. Those figures
+are measured in-machine against the free-running 1us counter and published in
+`MBV_STATS[6..9]`; a scene cut is written out in full rather than deferred to
+the next blanking interval, because running slightly long costs one frame with
+a seam whereas deferring would leave the whole picture miscoloured for 83ms.
+
 ## Encoding
 
 ```
@@ -167,6 +200,7 @@ knobs:
 | `-k` | 20000 | byte budget per keyframe |
 | `-m` | 30000 | hard chunk ceiling; must fit `MBV_SCRATCH` in `mbvplay.c` |
 | `-s` | 8 | motion search radius in pixels |
+| `-p` | 108 | palette snap threshold, squared RGB distance; 0 disables |
 
 ## Playing it
 
@@ -178,9 +212,10 @@ make VIDEO_PLAYER=1        # builds the payload and encodes CD/VIDEO.MBV
 
 `make VIDEO_PLAYER=1 MBV_STATS=1` additionally publishes progress counters at
 physical `0x00100000`, readable while it runs with
-`MEMDUMP PHYS:00100000 28 1` in the emulator console: stage, frames presented,
-bytes consumed, DAC underruns, and the streaming reader's state. Underruns
-should be zero.
+`MEMDUMP PHYS:00100000 44 1` in the emulator console: stage, frames presented,
+bytes consumed, DAC underruns, the streaming reader's state, the measured
+vertical sync pulse, and the size and duration of the last palette upload.
+Underruns should be zero.
 
 ## Where the time goes
 
