@@ -7,16 +7,15 @@
 /*
  * Timer-paced output to the YM2612 channel-6 DAC.
  *
- * Why this exists, rather than the busy-flag pacing pcmstream.c uses:
- * that loop writes a sample, then spins until the YM2612 clears its busy
- * flag, and takes whatever rate that produces as the sample rate.  The busy
- * flag is not a sample clock.  Tsugaru models it as a flat 30us
- * (YM2612_DATA_WRITE_BUSY_NS in towns/sound/sound.cpp), which is where the
- * "about 32kHz" figure in pcmstream.h comes from - but on a real YM2612 the
- * flag is a register-write interlock lasting a few microseconds, so the same
- * loop runs far faster on real hardware than in the emulator.  A stream
- * authored at one rate and played back at "whatever the busy flag gives on
- * this machine" is off by different amounts on every target.
+ * Why this exists, rather than pacing off the YM2612's busy flag: that
+ * approach writes a sample, spins until the flag clears, and takes whatever
+ * rate that produces as the sample rate.  The busy flag is not a sample clock.
+ * It is a register-write interlock, held for a fixed number of the chip's own
+ * cycles - measured on this machine at about 11us for a write to a register
+ * below 0xA0 (which the DAC data register 0x2A is), 6us at or above it, and
+ * 2us for an address write.  Pacing on it yields a rate that depends on how
+ * long the rest of the loop takes on the machine in question, which is to say
+ * a different rate on every target.
  *
  * The FM TOWNS has an actual clock for this: a free-running 16-bit counter at
  * I/O 0x26 that increments once per microsecond and wraps every 65.536ms.
@@ -43,15 +42,27 @@
 #define FMT_DAC_SOUND_MUTE      0x4D5
 #define FMT_DAC_SOUND_AUDIO     0x4EC
 
-/* Source rate of the decoded stream.  The DAC is written once per source
- * sample: the asset is authored at this rate, so there is no resampling and
- * no zero-order-hold stretch in the output path at all.  62.5us per sample
- * is not an integer number of timer counts, so the half-microsecond is
- * carried in `frac` and the period alternates 62, 63, 62, 63 - exact on
- * average, with one microsecond of jitter on a 62.5us period. */
+/* Sample period in quarter-microseconds.  Quarters rather than whole counts
+ * because the useful rates here do not divide 1000000 evenly: 16 kHz is 62.5us
+ * and 32 kHz is 31.25us.  Carrying the remainder makes the period alternate
+ * (62, 63, 62, 63 at 16 kHz) so the average rate is exact, with at most one
+ * microsecond of jitter. */
+#define FMT_DAC_PERIOD_Q4(rate) ((uint16_t)(4000000u / (rate)))
+
+/* Source rate of the decoded MP2 stream.  The DAC is written once per source
+ * sample: the asset is authored at this rate, so there is no resampling and no
+ * zero-order-hold stretch in the output path at all. */
 #define FMT_DAC_RATE            16000u
-#define FMT_DAC_PERIOD_US       62u
-#define FMT_DAC_PERIOD_FRAC     1u    /* plus 1/2 us */
+
+/* Advance a deadline by one sample period, carrying the fractional part.
+ * Shared with pcmstream.c, which paces its own ring the same way. */
+static inline void fmt_dac_advance(uint16_t *deadline, uint8_t *frac,
+                                   uint16_t period_q4)
+{
+    unsigned step = (unsigned)period_q4 + *frac;
+    *frac = (uint8_t)(step & 3u);
+    *deadline += (uint16_t)(step >> 2);
+}
 
 /* If the tick is starved for longer than this, the backlog is abandoned and
  * the deadline resynchronised to now.  Without it, a long stall would leave
@@ -64,7 +75,7 @@ typedef struct {
     uint16_t       pos;      /* next sample index within buf */
     uint16_t       len;      /* samples in buf */
     uint16_t       deadline; /* free-run timer value the next write is due at */
-    uint8_t        frac;     /* carried half-microseconds, 0 or 1 */
+    uint8_t        frac;     /* carried quarter-microseconds, 0..3 */
     uint8_t        active;
     uint8_t        last;     /* last byte written, held across an underrun */
     uint32_t       underruns;/* samples the decoder failed to supply in time */
@@ -78,7 +89,6 @@ extern fmt_dac_state fmt_dac;
 static inline void fmt_dac_tick(void)
 {
     uint16_t now;
-    unsigned step;
 
     if (!fmt_dac.active) {
         return;
@@ -97,13 +107,7 @@ static inline void fmt_dac_tick(void)
     }
     outb(fmt_dac.last, FMT_DAC_YM_DATA0);
 
-    step = FMT_DAC_PERIOD_US;
-    fmt_dac.frac += FMT_DAC_PERIOD_FRAC;
-    if (fmt_dac.frac >= 2u) {
-        fmt_dac.frac -= 2u;
-        step++;
-    }
-    fmt_dac.deadline += (uint16_t)step;
+    fmt_dac_advance(&fmt_dac.deadline, &fmt_dac.frac, FMT_DAC_PERIOD_Q4(FMT_DAC_RATE));
     if ((int16_t)(now - fmt_dac.deadline) > FMT_DAC_RESYNC_US) {
         fmt_dac.deadline = now;
     }

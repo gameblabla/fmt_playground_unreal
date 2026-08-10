@@ -8,6 +8,7 @@
 #include "fmt_sprite.h"
 #include "vgmplay.h"
 #include "mp2stream.h"
+#include "io.h"
 
 struct cpu_ident cpu_id;
 struct eregs;
@@ -213,9 +214,80 @@ static void draw_15bpp_test(void)
 }
 #endif
 
+#if FMT_YM_BUSY_PROBE
+/* Measures how long the YM2612 holds its busy flag (0x4D8 bit 7) after each
+ * kind of register write, timed against the TOWNS 1us free-running counter at
+ * I/O 0x26, and leaves the results at physical 0x00080000 - above this
+ * payload, which loads at 0x10000 and is under 256 KiB - so they can be read
+ * back with `MEMDUMP PHYS:00080000` in the emulator's console.
+ *
+ * Layout at 0x80000: "YMBZ", then the measured microseconds for an address
+ * write, a data write to a register below 0xA0 (the DAC data register 0x2A is
+ * one of these), and a data write to a register at or above 0xA0.
+ *
+ * The poll loop itself is one IN plus a test and branch, so a measurement is
+ * quantised to roughly a microsecond and reads slightly high. That is ample to
+ * tell the real durations from the flat 30us the emulator used to apply.
+ *
+ * Build with `make BUSY_PROBE=1`. This is a diagnostic, not part of the demo.
+ */
+#define PROBE_RESULTS ((volatile uint8_t *)0x00080000u)
+
+static uint8_t probe_one(uint8_t reg, uint8_t val, uint8_t addr_only)
+{
+    uint16_t t0, t1;
+
+    while (inb(0x4D8) & 0x80) {
+    }
+    if (addr_only) {
+        t0 = inw(0x26);
+        outb(reg, 0x4D8);
+    } else {
+        outb(reg, 0x4D8);
+        while (inb(0x4D8) & 0x80) {
+        }
+        t0 = inw(0x26);
+        outb(val, 0x4DA);
+    }
+    while (inb(0x4D8) & 0x80) {
+    }
+    t1 = inw(0x26);
+    return (uint8_t)(t1 - t0);
+}
+
+static void ym_busy_probe(void)
+{
+    uint8_t addr_us = 255, low_us = 255, high_us = 255, i, v;
+
+    outb(0x03, 0x4D5);        /* unmute FM/PCM so the chip is live */
+    outb(0x7f, 0x4EC);
+
+    /* Take the smallest of several runs: the poll loop can only overshoot. */
+    for (i = 0; i < 16; ++i) {
+        v = probe_one(0x2A, 0x80, 1); if (v < addr_us) addr_us = v;
+        v = probe_one(0x2A, 0x80, 0); if (v < low_us)  low_us  = v;
+        v = probe_one(0xA4, 0x10, 0); if (v < high_us) high_us = v;
+    }
+
+    PROBE_RESULTS[0] = 'Y';
+    PROBE_RESULTS[1] = 'M';
+    PROBE_RESULTS[2] = 'B';
+    PROBE_RESULTS[3] = 'Z';
+    PROBE_RESULTS[4] = addr_us;
+    PROBE_RESULTS[5] = low_us;
+    PROBE_RESULTS[6] = high_us;
+    PROBE_RESULTS[7] = 0xA5;
+
+    while (1) {
+    }
+}
+#endif
+
 void start_main(void)
 {
-#if FMT_VGM_PLAYER
+#if FMT_YM_BUSY_PROBE
+    ym_busy_probe();
+#elif FMT_VGM_PLAYER
     if (fmt_vgm_load_file("MUSIC.FTV") == 0) {
         fmt_vgm_play();
         fmt_vgm_stop();

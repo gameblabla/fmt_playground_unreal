@@ -1,4 +1,5 @@
 #include "pcmstream.h"
+#include "dacout.h"
 #include "io.h"
 #include "cdrom.h"
 #include "iso9660.h"
@@ -12,7 +13,6 @@
 #define YM_REG_DAC_DATA     0x2A
 #define YM_BUSY             0x80
 
-#define YM_WAIT_1US         0x6C /* 1us wait register - see the loop below. */
 
 /* TOWNSIO_SOUND_MUTE/TOWNSIO_SOUND_AUDIO - see the FM TOWNS Technical
  * Databook, Table I-5-42 (Audio register, 0x4EC) and I-5-43 (FM/PCM
@@ -96,6 +96,8 @@ int fmt_pcm_stream_play_streaming(void)
     fmt_cd_stream cd;
     uint32_t play_pos = 0;
     uint32_t poll = 0;
+    uint16_t deadline;
+    uint8_t frac = 0;
 
     if (!g_loaded) {
         return -1;
@@ -131,29 +133,31 @@ int fmt_pcm_stream_play_streaming(void)
     outb(YM_REG_DAC_DATA, YM_ADDR0);   /* Latch the DAC data register once - every sample below just hits YM_DATA0. */
 
     disable_interrupts();
+    deadline = inw(FMT_DAC_FREERUN_TIMER);
     for (;;) {
         if (g_stop_requested) {
             goto done;
         }
 
-        /* One disc byte per DAC write, 1:1, exactly as dac_pcm.c does
-         * it - the file is authored at the DAC's own pace (see
-         * FMT_PCM_STREAM_RATE), so there is no resampling to do here.
-         * An earlier version played an 11025Hz file by holding each
-         * sample for three writes; that zero-order-hold staircase is
-         * audible as harshness on its own, quite apart from the
-         * emulator timing bug it was masking. */
-        outb(0, YM_WAIT_1US);
+        /* One disc byte per DAC write, 1:1 - the file is authored at
+         * FMT_PCM_STREAM_RATE, so there is no resampling to do here. */
         outb(g_ring[play_pos & (PCM_RING_BYTES - 1u)], YM_DATA0);
         play_pos++;
+        fmt_dac_advance(&deadline, &frac, FMT_DAC_PERIOD_Q4(FMT_PCM_STREAM_RATE));
 
-        /* Refill during the ~30us the DAC is busy, one I/O operation at
-         * a time, re-checking the busy flag between each. That keeps
-         * the sample period exactly the busy window - the loop stops
-         * the instant the DAC is ready, so streaming can never push a
-         * sample late - while still soaking up every microsecond of
-         * what would otherwise be a spin. */
-        while (inb(YM_ADDR0) & YM_BUSY) {
+        /* Refill until the next sample is due, one I/O operation at a time,
+         * re-checking the clock between each. This used to spin on the
+         * YM2612's busy flag instead and take that as the sample period,
+         * which is where the old "about 32kHz, measured at 32.3kHz under
+         * TOWNSEMU" figure came from. The flag is a register-write interlock
+         * of about 11us, not a sample clock, so that gave a rate set by
+         * however long the rest of this loop happened to take - different on
+         * every machine. The free-running 1us counter at I/O 0x26 is an
+         * actual clock; see dacout.h. */
+        for (;;) {
+            if ((int16_t)(inw(FMT_DAC_FREERUN_TIMER) - deadline) >= 0) {
+                break;
+            }
             fmt_cdrom_stream_step(&cd, play_pos, 1);
             if (g_stop_requested) {
                 goto done;
@@ -204,6 +208,8 @@ done:
 int fmt_pcm_stream_play_buffer(const uint8_t *buffer, uint32_t size)
 {
     uint32_t play_pos = 0;
+    uint16_t deadline;
+    uint8_t frac = 0;
 
     if (buffer == 0 || size == 0) {
         return -1;
@@ -220,18 +226,19 @@ int fmt_pcm_stream_play_buffer(const uint8_t *buffer, uint32_t size)
     outb(YM_REG_DAC_DATA, YM_ADDR0);
 
     disable_interrupts();
+    deadline = inw(FMT_DAC_FREERUN_TIMER);
     for (;;) {
         if (g_stop_requested) {
             break;
         }
 
-        outb(0, YM_WAIT_1US);
         outb(buffer[play_pos], YM_DATA0);
         if (++play_pos == size) {
             play_pos = 0;
         }
+        fmt_dac_advance(&deadline, &frac, FMT_DAC_PERIOD_Q4(FMT_PCM_STREAM_RATE));
 
-        while (inb(YM_ADDR0) & YM_BUSY) {
+        while ((int16_t)(inw(FMT_DAC_FREERUN_TIMER) - deadline) < 0) {
             if (g_stop_requested) {
                 goto done;
             }

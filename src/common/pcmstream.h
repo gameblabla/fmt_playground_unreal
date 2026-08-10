@@ -32,16 +32,17 @@
 
 /* Sample rate the PCM file must be authored at.
  *
- * This is not a free choice: the loop writes one byte per DAC write and
- * each write is paced by the YM2612's busy flag, which holds for a
- * fixed ~30us on real hardware (and in TOWNSEMU, see dacBusyUntil), so
- * the output rate is whatever that pacing gives - about 32kHz, measured
- * at 32.3kHz under TOWNSEMU. FMTOWNS_32KHZPCM_WITHDAC authors its clip
- * at 32000Hz for exactly this reason and this project follows it: one
- * file sample == one hardware DAC write, no resampling on the Towns
- * side at all. Anything else has to be stretched by the playback loop,
- * and a zero-order hold is the only stretch cheap enough to do between
- * DAC writes - which sounds like what it is.
+ * This is now a free choice rather than whatever the hardware happened to
+ * give: the loop paces each write against the TOWNS free-running 1us counter
+ * at I/O 0x26 (see dacout.h), so the file plays at exactly this rate on any
+ * machine.  It previously spun on the YM2612's busy flag and took that as the
+ * sample period, which is where the old "about 32kHz, measured at 32.3kHz
+ * under TOWNSEMU" came from - the flag is a register-write interlock of about
+ * 11us, not a sample clock, so the resulting rate depended on how long the
+ * rest of the loop took on the machine in question.
+ *
+ * 32000 is kept because the shipped asset is authored at it, and because one
+ * file sample is still one DAC write - no resampling on the Towns side.
  *
  * Author with: sox <input> -r 32000 -c 1 -b 8 -e unsigned-integer \
  *                  -t raw CD/MUSIC.PCM gain -n -1 */

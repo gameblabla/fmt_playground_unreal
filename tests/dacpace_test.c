@@ -64,6 +64,29 @@ int main(void)
     snprintf(buf, sizeof buf, "%lu wraps crossed", span / 65536UL);
     check("16-bit timer wrap does not disturb pacing", span / 65536UL > 100, buf);
 
+    /* ---- 1b. the shared period helper at pcmstream's 32 kHz ---- */
+    {
+        uint16_t dl = 0;
+        uint8_t fr = 0;
+        unsigned long n31 = 0, n32 = 0, nother = 0;
+        unsigned long total = 0;
+        uint16_t prev = 0;
+        for (i = 0; i < 320000; i++) {   /* 10 seconds at 32 kHz */
+            prev = dl;
+            fmt_dac_advance(&dl, &fr, FMT_DAC_PERIOD_Q4(32000u));
+            {
+                unsigned d = (uint16_t)(dl - prev);
+                if (d == 31) n31++; else if (d == 32) n32++; else nother++;
+                total += d;
+            }
+        }
+        rate = 320000.0 * 1000000.0 / (double)total;
+        snprintf(buf, sizeof buf, "%.4f Hz, 31us x%lu, 32us x%lu, other x%lu",
+                 rate, n31, n32, nother);
+        check("32 kHz period is exact on average too",
+              nother == 0 && rate > 31999.9 && rate < 32000.1, buf);
+    }
+
     /* ---- 2. underrun is counted and holds the last value ---- */
     fmt_dac_start();
     fmt_dac_submit(pcm, 4);

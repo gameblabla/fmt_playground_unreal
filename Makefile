@@ -21,9 +21,10 @@ GFX_TEST        ?= 0
 VGM_PLAYER      ?= 0
 MP2_PLAYER      ?= 1
 TEST_256_MODE   ?= 0
+BUSY_PROBE      ?= 0
 CFLAGS          += -DFMT_PIXEL_TEST_BPP=$(PIXEL_TEST_BPP) -DFMT_GFX_TEST=$(GFX_TEST) \
                   -DFMT_VGM_PLAYER=$(VGM_PLAYER) -DFMT_MP2_PLAYER=$(MP2_PLAYER) \
-                  -DFMT_TEST_256x240=$(TEST_256_MODE)
+                  -DFMT_TEST_256x240=$(TEST_256_MODE) -DFMT_YM_BUSY_PROBE=$(BUSY_PROBE)
 
 VGM_SOURCE      = artifacts/neo_holy_war/neo_holy_war_trimmed_opn2_only_optimized.vgm
 VGM_ASSET       = CD/MUSIC.FTV
