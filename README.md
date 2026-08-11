@@ -1,13 +1,19 @@
-Example FM TOWNS MARTY CD program
-===============================
-
-See https://github.com/pinterior/elf2exp/
-to set up toolchain.
+Unreal FM TOWNS CD-ROM/IC card example
+=======================================
 
 No IO.SYS, no TOWNS OS and no DOS extender are needed: the disc boots
 through its own "IPL4" boot sector straight into 32-bit protected mode.
 
-Use RUN.SH to build the disc image and run it with Tsugaru_CUI.elf.
+Use RUN.SH to build the disc image and run it with Tsugaru_CUI.elf (or alternatively, MAME. Real hardware can also do the trick).
+
+(Note : this was AI assisted. It was a massive pain in the arse to get it working.
+I had made an earlier attempt before using MEMTEST as a base, it worked from floppy disk but not CDROM, much less IC card.)
+
+Other things were fixed from my prior examples, like the display routines, drawing, page flipping,
+and added features like videos (it uses the YM2612's DAC for that purpose) with a custom format,
+PCM streaming (and CD-DA on top of that, you can use either depending on your needs), a basic VGM like player for the YM2612 (note that it assumes Megadrive like music without any PSG writes obviously),
+hardware sprites, SCSI DMA, an experimental mp2 player (it works on low bitrates at mono but cannot recommend it unless your FM TOWNS game needs to fit as much content as possible), 6 buttons pad support (thanks bcc) etc...
+
 
 How it boots
 ------------
@@ -42,7 +48,7 @@ This example loads image from CD, loads it into buffer, draws it to VRAM with do
 Booting from an IC Memory Card
 ------------------------------
 
-`make iccard` builds the same game for the FM TOWNS' IC Memory Card slot
+`make iccard` builds the same example for the FM TOWNS' IC Memory Card slot
 instead of the CD: a card image that the boot ROM starts by itself
 (`./run_icm.sh`, or hold I+C+M at power-on on real hardware). No CD-ROM
 or CD-DA code is compiled into that build at all - a machine booting off
