@@ -58,6 +58,7 @@ MBV_ASSET       = CD/VIDEO.MBV
 
 OBJS            = src/boot/head.o src/boot/reloc.o src/boot/assets.o src/main.o \
                   src/common/common.o src/common/palette.o src/common/libfmt.o src/common/pad.o \
+                  src/common/machine.o \
                   src/common/fmt_layers.o src/common/fmt_sprite.o \
                   src/common/cdrom.o src/common/sound.o src/common/iso9660.o src/common/pcmstream.o src/common/dacout.o src/common/mp2.o src/common/mp2_fast.o src/common/kjmp2_fast.o src/common/mp2stream.o \
                   src/common/cdda.o
@@ -123,32 +124,52 @@ $(MBV_ASSET): $(MBV_SOURCE) build/mbvenc tools/mkmbv.sh
 # object (-Bsymbolic), which is what actually gets objcopy'd to a flat
 # binary and embedded in the boot image.
 # ---------------------------------------------------------------------
-# Where the IPL loads the payload (src/boot/defs.h's TSTLOAD, 0x1000:0), and
-# the first address that is not main RAM.  On the FM TOWNS the low 768KB are
-# RAM and 0xC0000 upwards is the FMR VRAM window, the I/O ROMs and the system
-# ROM (TOWNSADDR_FMR_VRAM_BASE in TOWNSEMU's townsdef.h); RAM only resumes at
-# 0x100000.  So text, data *and .bss* all have to end below 0xC0000.
+# Where the IPL loads the payload (src/boot/defs.h's TSTLOAD, 0x1000:0).
+# The loaded image's real ceiling is the boot sector, not the 0xC0000 FMR
+# VRAM window it looks like it should be: bootsect.S relocates itself (and
+# its stack, SP = 0x3FF4) to INITSEG = 0x9000 in boot/defs.h, and then loads
+# the payload upward from 0x10000 -- so the moment the payload reaches
+# 0x90000 it overwrites the loader that is still running and the machine
+# boots to a black screen with no diagnostic at all.  That is 512 KiB of
+# payload, not the 704 KiB a 0xC0000 ceiling would allow.  Raising it means
+# moving INITSEG up (0xB000 would buy another 128 KiB, if 0xB0000 is RAM on
+# the target machine) -- not relaxing this number.
+PAYLOAD_LOAD    = 0x10000
+PAYLOAD_LIMIT   = 0x90000
+# .bss is linked into extended RAM instead (see src/boot/mygame_shared.lds):
+# it is NOBITS, so it never has to fit under the 0xC0000 FMR VRAM window with
+# the loaded image.  A Marty has 2 MB, so 0x200000 is the hard ceiling.
+BSS_LIMIT       = 0x200000
 #
 # This is checked rather than assumed because the failure is silent and
-# baffling: .bss that runs over the line is simply not memory.  Writes to it
-# land in the VRAM window and read back as whatever the CRTC left there, so
-# the program keeps running and merely gets impossible data - a CD ring buffer
-# full of 0xFF that the drive never put there, in the case that prompted this.
-PAYLOAD_LOAD    = 0x10000
-PAYLOAD_LIMIT   = 0xC0000
+# baffling: .bss (or a loaded section) that runs over its line is simply not
+# memory.  Writes to it land in the VRAM window (or overwrite the running
+# boot loader) and read back as whatever was already there, so the program
+# keeps running and merely gets impossible data - a CD ring buffer full of
+# 0xFF that the drive never put there, in the case that prompted this.
 
 mygame_shared: $(OBJS) src/boot/mygame_shared.lds Makefile
 	$(LD) --warn-constructors --warn-common -static -T src/boot/mygame_shared.lds \
 		-o $@ $(OBJS) && \
 	$(LD) -shared -Bsymbolic -T src/boot/mygame_shared.lds -o $@ $(OBJS)
 	@objdump -h $@ | awk -v base="$(PAYLOAD_LOAD)" -v top="$(PAYLOAD_LIMIT)" \
-		'$$2==".bss" { \
-		   base = strtonum(base); top = strtonum(top); \
-		   last = base + strtonum("0x" $$4) + strtonum("0x" $$3); \
-		   printf "payload ends at 0x%x, main RAM ends at 0x%x (%d bytes spare)\n", \
-		          last, top, top - last; \
-		   if (last > top) { \
-		     print "payload overruns main RAM: .bss past 0xC0000 is the FMR VRAM window, not memory" > "/dev/stderr"; \
+		-v bsstop="$(BSS_LIMIT)" \
+		'BEGIN { base = strtonum(base); top = strtonum(top); \
+		         bsstop = strtonum(bsstop); imgend = 0 } \
+		 $$2==".bss" { bssend = base + strtonum("0x" $$4) + strtonum("0x" $$3); next } \
+		 $$1 ~ /^[0-9]+$$/ && $$2 !~ /^\.(bss|comment|debug)/ { \
+		   e = base + strtonum("0x" $$4) + strtonum("0x" $$3); \
+		   if (e > imgend) imgend = e } \
+		 END { \
+		   printf "loaded image ends at 0x%x / 0x%x (%d bytes spare, boot-sector ceiling)\n", \
+		          imgend, top, top - imgend; \
+		   printf ".bss ends at 0x%x / 0x%x (%d bytes spare)\n", \
+		          bssend, bsstop, bsstop - bssend; \
+		   if (imgend > top) { \
+		     print "loaded image overruns low RAM: past 0x90000 overwrites the still-running boot loader" > "/dev/stderr"; \
+		     exit 1 } \
+		   if (bssend > bsstop) { \
+		     print ".bss overruns a 2 MB Marty (extended RAM ends at 0x200000)" > "/dev/stderr"; \
 		     exit 1 } }'
 
 mygame_shared.bin: mygame_shared
@@ -204,6 +225,9 @@ src/common/palette.o: src/common/palette.c $(FLAGS_STAMP)
 
 src/common/libfmt.o: src/common/libfmt.c src/common/libfmt.h $(FLAGS_STAMP)
 	$(CC) -c $(CFLAGS) -o $@ src/common/libfmt.c
+
+src/common/machine.o: src/common/machine.c src/common/machine.h $(FLAGS_STAMP)
+	$(CC) -c $(CFLAGS) -o $@ src/common/machine.c
 
 src/common/fmt_layers.o: src/common/fmt_layers.c src/common/fmt_layers.h $(FLAGS_STAMP)
 	$(CC) -c $(CFLAGS) -o $@ src/common/fmt_layers.c
@@ -318,6 +342,7 @@ ICM_PAYLOAD     = build/icm_payload.bin
 
 ICM_OBJS        = src/boot/head.o src/boot/assets.o src/main.o \
                   src/common/common.o src/common/palette.o src/common/libfmt.o src/common/pad.o \
+                  src/common/machine.o \
                   src/common/fmt_layers.o src/common/fmt_sprite.o \
                   src/common/icm.o src/common/sound.o src/common/pcmstream.o src/common/dacout.o \
                   src/common/mp2.o src/common/mp2_fast.o src/common/kjmp2_fast.o src/common/mp2stream.o

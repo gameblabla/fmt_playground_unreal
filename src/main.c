@@ -12,6 +12,8 @@
 #include "io.h"
 #include "dacout.h"
 #include "media.h"
+#include "machine.h" /* fmt_machine_detect() -- Marty/UX (narrow) vs standard
+                        (wide) memory map, see machine.h's block comment */
 
 struct cpu_ident cpu_id;
 struct eregs;
@@ -334,6 +336,13 @@ static void ym_busy_probe(void)
 
 void start_main(void)
 {
+    /* Must run before anything below touches VRAM (fmt_set_mode() included)
+     * -- it picks the physical VRAM base every later VRAM store uses. See
+     * machine.h: this payload was verified only against Marty originally,
+     * and Marty/UX (386SX) use a different VRAM physical address than every
+     * other FM TOWNS model. */
+    fmt_machine_detect();
+
     /* Get the asset medium ready before anything asks it for a file. On
      * the CD build this is nothing at all; on the IC card build it reads
      * the card's directory. Failing it is not fatal here - the players
