@@ -133,10 +133,12 @@ void fmt_cdc_drain_status(void)
 
 void fmt_cdc_issue(uint8_t cmd, const uint8_t param[8])
 {
-    outb(cmd, CD_COMMAND_STATUS);
+    /* Queue all eight parameters before firing the command.  The real CDC
+     * starts the command with the parameter FIFO already populated. */
     for (int i = 0; i < 8; i++) {
         outb(param[i], CD_PARAMETER_DATA);
     }
+    outb(cmd, CD_COMMAND_STATUS);
 }
 
 /* Fills in the 9 bytes a MODE1READ takes: the command byte followed by
@@ -277,11 +279,11 @@ unsigned fmt_cdrom_stream_step(fmt_cd_stream *st, uint32_t play_pos,
             n = budget;
         }
         for (unsigned i = 0; i < n; i++) {
-            uint8_t b = st->cmd[st->cmd_idx + i];
-            if (st->cmd_idx + i == 0) {
-                outb(b, CD_COMMAND_STATUS);
+            unsigned issue_idx = st->cmd_idx + i;
+            if (issue_idx < 8u) {
+                outb(st->cmd[issue_idx + 1u], CD_PARAMETER_DATA);
             } else {
-                outb(b, CD_PARAMETER_DATA);
+                outb(st->cmd[0], CD_COMMAND_STATUS);
             }
         }
         st->cmd_idx = (uint8_t)(st->cmd_idx + n);

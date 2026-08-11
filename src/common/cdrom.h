@@ -151,7 +151,7 @@ typedef struct {
     uint32_t total_sectors;  /* sectors the file occupies */
     uint32_t sector;         /* next sector of the file to fetch */
     uint16_t byte_idx;       /* bytes taken so far from the sector in flight */
-    uint8_t  cmd[9];         /* command byte + 8 parameter bytes being issued */
+    uint8_t  cmd[9];         /* command byte + 8 params; params issue first */
     uint8_t  cmd_idx;
     uint8_t  state;
     uint8_t  loop;
