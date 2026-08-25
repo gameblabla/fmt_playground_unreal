@@ -261,15 +261,12 @@ build/mp2_synth_table.h: tools/gen_mp2_synth_table.py
 	mkdir -p build
 	python3 $< $@
 
-build/mp2_synth_window.h: tools/gen_mp2_window.py mp3play/MP3.ASM
-	mkdir -p build
-	python3 tools/gen_mp2_window.py mp3play/MP3.ASM $@
-
-build/mp2_dct32.h: tools/gen_mp2_dct.py mp3play/MP3.ASM
-	mkdir -p build
-	python3 tools/gen_mp2_dct.py mp3play/MP3.ASM $@
-
-src/common/mp2.o: src/common/mp2.c src/common/mp2.h build/mp2_synth_table.h build/mp2_synth_window.h build/mp2_dct32.h $(FLAGS_STAMP)
+# mp2.c takes its synthesis window and DCT coefficients from the checked-in
+# mp2_synth_window_ref.h / mp2_synth_ref.h, not from generated headers, so the
+# rules that derived those from mp3play/MP3.ASM built two headers nothing ever
+# included -- and mp3play/ is not in this repo, so the dead prerequisite failed
+# the whole build.  build/mp2_synth_table.h above is the one that is real.
+src/common/mp2.o: src/common/mp2.c src/common/mp2.h build/mp2_synth_table.h $(FLAGS_STAMP)
 	$(CC) -c $(CFLAGS) -o $@ src/common/mp2.c
 
 src/common/mp2_fast.o: src/common/mp2_fast.S $(FLAGS_STAMP)
