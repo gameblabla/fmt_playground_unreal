@@ -93,6 +93,9 @@ const fmt_mode_t *fmt_current_mode(void);
 /* Loads `count` RGB888 triplets (24-bit -> the analog palette DACs)
  * starting at palette index 0. */
 void fmt_load_palette(const uint8_t *rgb888, int count);
+/* Upload only entries [first, first+count) of the palette pointed to by
+ * rgb888 (which is indexed from entry 0 regardless of `first`). */
+void fmt_load_palette_range(const uint8_t *rgb888, int first, int count);
 
 /* Blits an 8bpp or 16bpp (per the current mode's bpp) linear image of
  * `width`x`height`, `stride` bytes/line, into VRAM at the current
@@ -123,5 +126,11 @@ void fmt_wait_vsync(void);
  * cheap and must not block. */
 void fmt_wait_vsync_poll(void (*poll)(void));
 int fmt_flip_page_poll(void (*poll)(void));
+
+/* Swap the pages immediately, without waiting for vertical blank.  For a
+ * caller that already waited for one itself in order to do other
+ * blanking-only work (palette RAM above all) and must not spend a second
+ * field on the flip. */
+int fmt_flip_page_now(void);
 
 #endif

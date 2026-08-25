@@ -62,6 +62,9 @@ static void draw_256x240_test(void)
     };
 
     fmt_set_mode(FMT_MODE_256x240_8BPP);
+    /* Palette RAM is CRTC-visible immediately: only ever write it inside
+     * vertical blanking. */
+    fmt_wait_vsync();
     fmt_load_palette(palette, 5);
     for (uint16_t y = 0; y < 240; ++y) {
         for (uint16_t x = 0; x < 256; ++x) {
@@ -93,6 +96,9 @@ static void draw_8bpp_test(void)
     };
 
     fmt_set_mode(FMT_MODE_320x240_8BPP);
+    /* Palette RAM is CRTC-visible immediately: only ever write it inside
+     * vertical blanking. */
+    fmt_wait_vsync();
     fmt_load_palette(palette, 5);
 
     if (!fmt_page_flipping_available() || fmt_draw_page() != 1) {
